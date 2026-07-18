@@ -1,0 +1,55 @@
+# phone-video-sync configuration
+# Copy to config.yaml and adjust as needed.
+
+# Local paths (relative to project root unless absolute)
+db_path: data/pvsync.db
+work_dir: work
+log_dir: logs
+
+# On-device scan root and archive destination
+remote_root: /sdcard
+archive_root: /sdcard/.compressed_archive
+
+# Video extensions to discover (lowercase, no dots)
+extensions:
+  - mp4
+  - mov
+  - mkv
+  - 3gp
+  - avi
+  - webm
+
+# Skip these path prefixes under remote_root
+skip_prefixes:
+  - Android/
+  - .compressed_archive/
+
+# Encoder settings (hevc_nvenc default; override video_encoder for software)
+video_encoder: hevc_nvenc
+preset: p5
+cq: 28
+audio_bitrate: 128k
+
+# Integrity check tolerances
+duration_tolerance_sec: 1.0
+require_smaller: true
+
+# Parallelism and retries
+encode_workers: 2
+max_attempts: 3
+retry_backoff_base_sec: 2.0
+subprocess_timeout_sec: 3600
+
+# After verification: archive (move on-phone) or delete
+delete_mode: archive
+
+# USB watch poll interval (seconds) for `phone-sync watch`
+watch_interval_sec: 5
+
+# Tool paths (empty = auto-detect via PATH)
+adb_path: null
+ffmpeg_path: null
+ffprobe_path: null
+
+# Compressed filename suffix before extension
+output_suffix: _hevc
