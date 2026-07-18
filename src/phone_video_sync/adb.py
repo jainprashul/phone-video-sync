@@ -30,12 +30,75 @@ class RemoteFile:
     path: str
     size: int
     mtime: int
+    width: int | None = None
+    height: int | None = None
+    duration_ms: int | None = None
+    mime_type: str | None = None
+    title: str | None = None
+    resolution: str | None = None
 
 
 @dataclass(frozen=True)
 class DeviceInfo:
     serial: str
     state: str
+
+
+def _normalize_storage_path(path: str) -> str:
+    p = path.replace("\\", "/").strip()
+    for prefix in ("/storage/emulated/0", "/storage/self/primary", "/sdcard"):
+        if p == prefix or p.startswith(prefix + "/"):
+            return "/sdcard" + p[len(prefix) :] if p != prefix else "/sdcard"
+    return p
+
+
+def parse_mediastore_row(line: str) -> dict[str, str]:
+    """Parse a single `content query` Row line into a field dict."""
+    # Row: 0 _data=/path/file.mp4, mime_type=video/mp4, width=1920, ...
+    if "Row:" not in line:
+        return {}
+    payload = line.split("Row:", 1)[1]
+    # drop leading " 0 " index
+    payload = re.sub(r"^\s*\d+\s+", "", payload.strip())
+    fields: dict[str, str] = {}
+    for part in re.split(r", (?=[A-Za-z0-9_]+=)", payload):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def quality_label(width: int | None, height: int | None) -> str:
+    if not width or not height:
+        return "?"
+    long_edge = max(width, height)
+    if long_edge >= 7680:
+        return "8K"
+    if long_edge >= 3840:
+        return "4K"
+    if long_edge >= 2560:
+        return "1440p"
+    if long_edge >= 1920:
+        return "1080p"
+    if long_edge >= 1280:
+        return "720p"
+    if long_edge >= 854:
+        return "480p"
+    if long_edge >= 640:
+        return "360p"
+    return f"{width}x{height}"
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "?"
+    total = int(round(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 class AdbClient:
@@ -311,7 +374,165 @@ class AdbClient:
 
         files.sort(key=lambda f: f.path)
         self._notify(f"Scan complete — {len(files)} video file(s) found.")
-        return files
+        return self.enrich_with_mediastore(files)
+
+    def enrich_with_mediastore(self, files: list[RemoteFile]) -> list[RemoteFile]:
+        """Merge Android MediaStore width/height/duration/mime onto find results."""
+        if not files:
+            return files
+        self._notify("Loading MediaStore video metadata…")
+        store = self.query_mediastore_videos()
+        if not store:
+            self._notify("MediaStore returned no rows — resolution/duration may be unknown.")
+            return files
+
+        enriched: list[RemoteFile] = []
+        hits = 0
+        for rf in files:
+            key = _normalize_storage_path(rf.path)
+            meta = store.get(key) or store.get(_normalize_storage_path(rf.path))
+            # also try exact path
+            if meta is None:
+                meta = store.get(rf.path)
+            if meta is None:
+                enriched.append(rf)
+                continue
+            hits += 1
+            enriched.append(
+                RemoteFile(
+                    path=rf.path,
+                    size=rf.size or meta.get("size") or 0,
+                    mtime=rf.mtime or meta.get("mtime") or 0,
+                    width=meta.get("width"),
+                    height=meta.get("height"),
+                    duration_ms=meta.get("duration_ms"),
+                    mime_type=meta.get("mime_type"),
+                    title=meta.get("title"),
+                    resolution=meta.get("resolution"),
+                )
+            )
+        self._notify(f"MediaStore matched {hits}/{len(files)} file(s).")
+        return enriched
+
+    def query_mediastore_videos(self) -> dict[str, dict]:
+        """Query content://media/external/video/media once; keyed by normalized path."""
+        projection = (
+            "_data:mime_type:width:height:duration:_size:date_modified:"
+            "resolution:title:_display_name"
+        )
+        uris = [
+            "content://media/external/video/media",
+            "content://media/external/file",
+        ]
+        by_path: dict[str, dict] = {}
+        for uri in uris:
+            cmd = f'content query --uri {uri} --projection "{projection}"'
+            # file provider may lack video columns; still try video URI first
+            if "file" in uri:
+                cmd = (
+                    'content query --uri content://media/external/file '
+                    '--projection "_data:mime_type:_size:date_modified:_display_name" '
+                    '--where "mime_type LIKE \'video/%\'"'
+                )
+            result = self.run(
+                ["shell", cmd],
+                timeout=max(self.timeout, 180),
+                check=False,
+                label=f"MediaStore {uri.split('/')[-1]}…",
+            )
+            stdout = result.stdout or ""
+            for line in stdout.splitlines():
+                fields = parse_mediastore_row(line)
+                path = fields.get("_data") or fields.get("_display_name")
+                if not path or not path.startswith("/"):
+                    continue
+                width = _to_int(fields.get("width"))
+                height = _to_int(fields.get("height"))
+                duration_ms = _to_int(fields.get("duration"))
+                size = _to_int(fields.get("_size"))
+                mtime = _to_int(fields.get("date_modified"))
+                entry = {
+                    "width": width,
+                    "height": height,
+                    "duration_ms": duration_ms,
+                    "size": size,
+                    "mtime": mtime,
+                    "mime_type": fields.get("mime_type"),
+                    "title": fields.get("title") or fields.get("_display_name"),
+                    "resolution": fields.get("resolution"),
+                }
+                by_path[_normalize_storage_path(path)] = entry
+                by_path[path] = entry
+            if by_path and "video/media" in uri:
+                break
+        return by_path
+
+    def remote_file_size(self, remote_path: str) -> int:
+        quoted = _shell_quote(remote_path)
+        out = self.shell(f"stat -c '%s' {quoted}", check=True).strip()
+        try:
+            return int(out.splitlines()[0])
+        except (ValueError, IndexError) as exc:
+            raise AdbError(f"Could not read size for {remote_path}: {out!r}") from exc
+
+    def stream_byte_range(
+        self,
+        remote_path: str,
+        *,
+        offset: int,
+        length: int,
+    ) -> bytes:
+        """Read [offset, offset+length) from a remote file via adb exec-out dd."""
+        if length <= 0:
+            return b""
+        quoted = _shell_quote(remote_path)
+        # Use 4KiB blocks; align skip, then trim
+        block = 4096
+        skip = offset // block
+        # Read enough blocks to cover offset alignment + length
+        lead = offset % block
+        count = (lead + length + block - 1) // block
+        cmd = self._base_cmd() + [
+            "exec-out",
+            f"dd if={quoted} bs={block} skip={skip} count={count} 2>/dev/null",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=max(self.timeout, 180),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise AdbError(f"Range read timed out: {remote_path}") from exc
+        data = result.stdout or b""
+        if not data:
+            raise AdbError(f"Empty range read for {remote_path} @ {offset}+{length}")
+        return data[lead : lead + length]
+
+    def stream_header_bytes(self, remote_path: str, *, max_bytes: int = 4_194_304) -> bytes:
+        """Read the first N bytes of a remote file via adb exec-out (for ffprobe)."""
+        return self.stream_byte_range(remote_path, offset=0, length=max_bytes)
+
+    def stream_head_and_tail(
+        self,
+        remote_path: str,
+        *,
+        head_bytes: int = 2 * 1024 * 1024,
+        tail_bytes: int = 12 * 1024 * 1024,
+    ) -> tuple[bytes, bytes, int]:
+        """Return (head, tail, total_size). Tail is empty if the file fits in head+tail."""
+        size = self.remote_file_size(remote_path)
+        if size <= 0:
+            raise AdbError(f"Remote file empty: {remote_path}")
+        if size <= head_bytes + tail_bytes:
+            whole = self.stream_byte_range(remote_path, offset=0, length=size)
+            return whole, b"", size
+        head = self.stream_byte_range(remote_path, offset=0, length=head_bytes)
+        tail = self.stream_byte_range(
+            remote_path, offset=size - tail_bytes, length=tail_bytes
+        )
+        return head, tail, size
 
     def pull(self, remote_path: str, local_path: Path, *, timeout: int | None = None) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,3 +624,12 @@ class AdbClient:
 def _shell_quote(path: str) -> str:
     """Single-quote a path for adb shell (POSIX)."""
     return "'" + path.replace("'", "'\\''") + "'"
+
+
+def _to_int(value: str | None) -> int | None:
+    if value is None or value == "" or value == "null":
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None

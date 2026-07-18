@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
+from typing import Any
 
 from phone_video_sync.models import VideoRecord
 
@@ -28,6 +30,44 @@ PREFERRED_FOLDER_HINTS = (
 
 
 @dataclass
+class FileMeta:
+    """Display metadata: ADB listing + MediaStore + optional ffprobe headers."""
+
+    remote_path: str
+    name: str
+    folder: str
+    extension: str
+    size: int
+    size_label: str
+    bucket: str
+    mtime: int
+    modified: str
+    status: str
+    attempts: int
+    recommended: bool
+    output_name: str
+    est_out_bytes: int
+    est_save_bytes: int
+    width: int | None = None
+    height: int | None = None
+    resolution: str = "?"
+    quality: str = "?"
+    duration_sec: float | None = None
+    duration_label: str = "?"
+    mime_type: str | None = None
+    container: str | None = None
+    video_codec: str | None = None
+    audio_codec: str | None = None
+    bitrate: int | None = None
+    bitrate_label: str = "?"
+    fps: str | None = None
+    pix_fmt: str | None = None
+    profile: str | None = None
+    level: str | None = None
+    title: str | None = None
+
+
+@dataclass
 class GroupStats:
     key: str
     count: int
@@ -47,6 +87,7 @@ class ScanBreakdown:
     by_size: list[GroupStats]
     recommended: list[VideoRecord]
     recommend_reason: str
+    metas: dict[str, FileMeta] = field(default_factory=dict)
 
 
 def folder_of(remote_path: str) -> str:
@@ -70,6 +111,171 @@ def format_bytes(n: int) -> str:
         value /= 1024
     return f"{n} B"
 
+
+def format_mtime(mtime: int) -> str:
+    try:
+        return datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return str(mtime)
+
+
+def output_name_for(remote_path: str, suffix: str = "_hevc") -> str:
+    path = PurePosixPath(remote_path)
+    return f"{path.stem}{suffix}.mp4"
+
+
+def build_file_meta(
+    rec: VideoRecord,
+    *,
+    recommended_paths: set[str],
+    output_suffix: str = "_hevc",
+    remote: Any | None = None,
+    probe: Any | None = None,
+) -> FileMeta:
+    from phone_video_sync.adb import format_duration, quality_label
+
+    path = PurePosixPath(rec.remote_path)
+    ext = path.suffix.lstrip(".").lower() or "?"
+    est_out = int(rec.size * 0.4)
+
+    width = getattr(remote, "width", None) if remote else None
+    height = getattr(remote, "height", None) if remote else None
+    duration_ms = getattr(remote, "duration_ms", None) if remote else None
+    mime = getattr(remote, "mime_type", None) if remote else None
+    title = getattr(remote, "title", None) if remote else None
+    res_str = getattr(remote, "resolution", None) if remote else None
+
+    video_codec = audio_codec = fps = pix_fmt = profile = level = None
+    bitrate = None
+    duration_sec = (duration_ms / 1000.0) if duration_ms else None
+
+    if probe is not None:
+        width = probe.width or width
+        height = probe.height or height
+        if probe.duration_sec:
+            duration_sec = probe.duration_sec
+        video_codec = probe.video_codec
+        audio_codec = probe.audio_codec
+        bitrate = probe.bitrate
+        fps = probe.fps
+        pix_fmt = probe.pix_fmt
+        profile = probe.profile
+        level = probe.level
+
+    if width and height:
+        res_str = f"{width}x{height}"
+    elif not res_str:
+        res_str = "?"
+
+    bitrate_label = "?"
+    if bitrate:
+        bitrate_label = f"{bitrate / 1_000_000:.1f} Mbps" if bitrate >= 1_000_000 else f"{bitrate // 1000} kbps"
+
+    return FileMeta(
+        remote_path=rec.remote_path,
+        name=path.name,
+        folder=folder_of(rec.remote_path),
+        extension=ext,
+        size=rec.size,
+        size_label=format_bytes(rec.size),
+        bucket=size_bucket_of(rec.size),
+        mtime=rec.mtime,
+        modified=format_mtime(rec.mtime),
+        status=rec.status.value if hasattr(rec.status, "value") else str(rec.status),
+        attempts=rec.attempts,
+        recommended=rec.remote_path in recommended_paths,
+        output_name=output_name_for(rec.remote_path, output_suffix),
+        est_out_bytes=est_out,
+        est_save_bytes=max(0, rec.size - est_out),
+        width=width,
+        height=height,
+        resolution=res_str or "?",
+        quality=quality_label(width, height),
+        duration_sec=duration_sec,
+        duration_label=format_duration(duration_sec),
+        mime_type=mime,
+        container=ext.upper() if ext != "?" else None,
+        video_codec=video_codec,
+        audio_codec=audio_codec,
+        bitrate=bitrate,
+        bitrate_label=bitrate_label,
+        fps=fps,
+        pix_fmt=pix_fmt,
+        profile=profile,
+        level=level,
+        title=title,
+    )
+
+
+def choice_label(meta: FileMeta, *, wide: bool = True) -> str:
+    """Human-readable line for checkbox/select UIs."""
+    flag = "★ " if meta.recommended else "  "
+    codec = meta.video_codec or "?"
+    if wide:
+        return (
+            f"{flag}{meta.size_label:>9}  {meta.quality:<5}  {meta.resolution:<10}  "
+            f"{meta.duration_label:>7}  {codec:<8}  "
+            f"{meta.name}  → {meta.output_name}"
+        )
+    return f"{flag}{meta.size_label:>9}  {meta.quality}  {meta.name}"
+
+
+def apply_remote_map(
+    breakdown: ScanBreakdown,
+    remote_by_path: dict[str, Any],
+    *,
+    output_suffix: str,
+) -> None:
+    """Refresh metas using MediaStore-enriched RemoteFile objects."""
+    rec_paths = {r.remote_path for r in breakdown.recommended}
+    for rec in breakdown.pending:
+        remote = remote_by_path.get(rec.remote_path)
+        prev = breakdown.metas.get(rec.remote_path)
+        probe = None
+        if prev and prev.video_codec:
+            # keep prior probe fields via a tiny namespace
+            from types import SimpleNamespace
+
+            probe = SimpleNamespace(
+                width=prev.width,
+                height=prev.height,
+                duration_sec=prev.duration_sec,
+                video_codec=prev.video_codec,
+                audio_codec=prev.audio_codec,
+                bitrate=prev.bitrate,
+                fps=prev.fps,
+                pix_fmt=prev.pix_fmt,
+                profile=prev.profile,
+                level=prev.level,
+            )
+        breakdown.metas[rec.remote_path] = build_file_meta(
+            rec,
+            recommended_paths=rec_paths,
+            output_suffix=output_suffix,
+            remote=remote,
+            probe=probe,
+        )
+
+
+def apply_probe_to_meta(
+    breakdown: ScanBreakdown,
+    remote_path: str,
+    probe: Any,
+    *,
+    output_suffix: str,
+    remote: Any | None = None,
+) -> None:
+    rec = next((r for r in breakdown.pending if r.remote_path == remote_path), None)
+    if rec is None:
+        return
+    rec_paths = {r.remote_path for r in breakdown.recommended}
+    breakdown.metas[remote_path] = build_file_meta(
+        rec,
+        recommended_paths=rec_paths,
+        output_suffix=output_suffix,
+        remote=remote,
+        probe=probe,
+    )
 
 def _group(
     records: list[VideoRecord],
@@ -145,7 +351,6 @@ def recommend(pending: list[VideoRecord]) -> tuple[list[VideoRecord], str]:
     ]
 
     if medium_plus:
-        # Prefer DCIM/Camera-like paths, then largest first
         ranked = sorted(
             medium_plus,
             key=lambda r: (_folder_priority(r.remote_path), -r.size),
@@ -157,7 +362,6 @@ def recommend(pending: list[VideoRecord]) -> tuple[list[VideoRecord], str]:
         )
         return ranked, reason
 
-    # All tiny/small: recommend largest quartile
     ordered = sorted(pending, key=lambda r: r.size, reverse=True)
     n = max(1, len(ordered) // 4)
     ranked = ordered[:n]
@@ -168,17 +372,29 @@ def recommend(pending: list[VideoRecord]) -> tuple[list[VideoRecord], str]:
     return ranked, reason
 
 
-def build_scan_breakdown(pending: list[VideoRecord]) -> ScanBreakdown:
+def build_scan_breakdown(
+    pending: list[VideoRecord],
+    *,
+    output_suffix: str = "_hevc",
+) -> ScanBreakdown:
     by_folder = _group(pending, lambda r: folder_of(r.remote_path))
     bucket_order = [label for label, _, _ in SIZE_BUCKETS]
     by_size = _group(pending, lambda r: size_bucket_of(r.size), order=bucket_order)
     recommended, reason = recommend(pending)
+    rec_paths = {r.remote_path for r in recommended}
+    metas = {
+        r.remote_path: build_file_meta(
+            r, recommended_paths=rec_paths, output_suffix=output_suffix
+        )
+        for r in pending
+    }
     return ScanBreakdown(
         pending=pending,
         by_folder=by_folder,
         by_size=by_size,
         recommended=recommended,
         recommend_reason=reason,
+        metas=metas,
     )
 
 

@@ -76,10 +76,15 @@ def scan_cmd(
         "-s",
         help="After the report, interactively choose folders/sizes/recommended to process",
     ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Force a fresh ADB find + MediaStore scan (ignore listing cache)",
+    ),
 ) -> None:
     """Discover videos and show a folder/size report (no transfers unless --select)."""
     pipeline = _pipeline(ctx, "scan")
-    report = pipeline.scan(select=select)
+    report = pipeline.scan(select=select, refresh=refresh)
     if report.errors and report.failed and report.done == 0:
         raise typer.Exit(code=1)
 
@@ -119,6 +124,11 @@ def process_cmd(
         "--max-size",
         help="Maximum file size (e.g. 500MB)",
     ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Force a fresh ADB find (ignore listing cache)",
+    ),
 ) -> None:
     """Pull, compress, verify, push, and archive/delete originals."""
     pipeline = _pipeline(ctx, "process")
@@ -130,6 +140,7 @@ def process_cmd(
         min_size=min_size,
         max_size=max_size,
         recommend=recommend,
+        refresh=refresh,
     )
     if report.errors and report.failed and report.done == 0:
         raise typer.Exit(code=1)

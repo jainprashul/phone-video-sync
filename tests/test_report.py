@@ -83,6 +83,20 @@ def test_filter_folder_and_min_size() -> None:
     assert filtered[0].remote_path.endswith("b.mp4")
 
 
+def test_file_meta_and_output_name() -> None:
+    from phone_video_sync.report import build_file_meta, output_name_for
+
+    assert output_name_for("/sdcard/DCIM/VID_1.mp4", "_hevc") == "VID_1_hevc.mp4"
+    rec = _rec("/sdcard/DCIM/Camera/clip.mp4", 150 * 1024 * 1024)
+    rec.mtime = 1_700_000_000
+    meta = build_file_meta(rec, recommended_paths={rec.remote_path}, output_suffix="_hevc")
+    assert meta.recommended is True
+    assert meta.extension == "mp4"
+    assert meta.output_name == "clip_hevc.mp4"
+    assert meta.size_label
+    assert "Camera" in meta.folder
+
+
 def test_parse_size() -> None:
     assert parse_size("100MB") == 100 * 1024 * 1024
     assert parse_size("1.5G") == int(1.5 * 1024**3)

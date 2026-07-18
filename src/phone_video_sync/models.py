@@ -47,6 +47,10 @@ class MediaInfo:
     audio_codec: str | None = None
     creation_time: str | None = None
     bitrate: int | None = None
+    fps: str | None = None
+    pix_fmt: str | None = None
+    profile: str | None = None
+    level: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
@@ -103,6 +107,8 @@ class Config:
     ffprobe_path: str | None = None
     output_suffix: str = "_hevc"
     watch_interval_sec: float = 5.0
+    # Reuse ADB find results for this many seconds unless --refresh
+    listing_cache_ttl_sec: float = 1800.0
     project_root: Path = field(default_factory=Path.cwd)
 
     @property

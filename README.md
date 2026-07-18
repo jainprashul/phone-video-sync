@@ -28,10 +28,13 @@ cp config.yaml.example config.yaml
 ## Usage
 
 ```bash
-# Discover videos — folder + size report + recommendation
+# Discover videos — folder + size report + recommendation (uses cache)
 phone-sync scan
 
-# Interactively pick recommended / folders / size buckets (optionally process)
+# Force a fresh phone search (ignore listing cache)
+phone-sync scan --refresh
+
+# Interactively pick with radio + checkboxes (optionally process)
 phone-sync scan --select
 
 # Compress only the recommended high-value set

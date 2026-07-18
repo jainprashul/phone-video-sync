@@ -46,6 +46,10 @@ delete_mode: archive
 # USB watch poll interval (seconds) for `phone-sync watch`
 watch_interval_sec: 5
 
+# Reuse last ADB find/MediaStore listing for this many seconds (0 = always rescan)
+# Codec probes are cached in SQLite until file size/mtime changes.
+listing_cache_ttl_sec: 1800
+
 # Tool paths (empty = auto-detect via PATH)
 adb_path: null
 ffmpeg_path: null

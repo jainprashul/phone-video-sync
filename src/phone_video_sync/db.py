@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -40,6 +41,34 @@ CREATE TABLE IF NOT EXISTS videos (
 );
 
 CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
+
+CREATE TABLE IF NOT EXISTS media_meta (
+    remote_path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    width INTEGER,
+    height INTEGER,
+    duration_sec REAL,
+    mime_type TEXT,
+    title TEXT,
+    resolution TEXT,
+    video_codec TEXT,
+    audio_codec TEXT,
+    bitrate INTEGER,
+    fps TEXT,
+    pix_fmt TEXT,
+    profile TEXT,
+    level TEXT,
+    source TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS listing_cache (
+    cache_key TEXT PRIMARY KEY,
+    device_serial TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    payload TEXT NOT NULL
+);
 """
 
 
@@ -184,6 +213,11 @@ class Database:
                     WHERE remote_path = ?
                     """,
                     resets,
+                )
+                # Invalidate stale media/probe cache for changed files
+                conn.executemany(
+                    "DELETE FROM media_meta WHERE remote_path = ?",
+                    [(row[-1],) for row in resets],
                 )
             if touches:
                 # Skip per-row updated_at touch for unchanged files — huge win on re-scans.
@@ -376,3 +410,182 @@ class Database:
         if not row:
             return 0, 0, 0
         return int(row["original"]), int(row["output"]), int(row["saved"])
+
+    # --- Listing + media/probe cache -----------------------------------------
+
+    def get_listing_cache(
+        self, cache_key: str, *, max_age_sec: float
+    ) -> tuple[list[dict[str, Any]], datetime] | None:
+        """Return (payload_rows, scanned_at) if cache is fresh, else None."""
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT scanned_at, payload FROM listing_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            scanned_at = datetime.fromisoformat(row["scanned_at"])
+            if scanned_at.tzinfo is None:
+                scanned_at = scanned_at.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+        age = (datetime.now(timezone.utc) - scanned_at).total_seconds()
+        if age < 0 or age > max_age_sec:
+            return None
+        try:
+            payload = json.loads(row["payload"])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, list):
+            return None
+        return payload, scanned_at
+
+    def save_listing_cache(
+        self,
+        cache_key: str,
+        *,
+        device_serial: str,
+        files: list[dict[str, Any]],
+    ) -> None:
+        now = _utc_now()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO listing_cache (cache_key, device_serial, scanned_at, payload)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    device_serial = excluded.device_serial,
+                    scanned_at = excluded.scanned_at,
+                    payload = excluded.payload
+                """,
+                (cache_key, device_serial, now, json.dumps(files)),
+            )
+
+    def clear_listing_cache(self, cache_key: str | None = None) -> None:
+        with self.connection() as conn:
+            if cache_key:
+                conn.execute(
+                    "DELETE FROM listing_cache WHERE cache_key = ?", (cache_key,)
+                )
+            else:
+                conn.execute("DELETE FROM listing_cache")
+
+    def get_media_meta(
+        self, remote_path: str, *, size: int, mtime: int
+    ) -> dict[str, Any] | None:
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM media_meta
+                WHERE remote_path = ? AND size = ? AND mtime = ?
+                """,
+                (remote_path, size, mtime),
+            ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
+
+    def get_media_meta_many(
+        self, items: list[tuple[str, int, int]]
+    ) -> dict[str, dict[str, Any]]:
+        """Batch lookup; items are (path, size, mtime)."""
+        if not items:
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        # SQLite variable limit — chunk
+        chunk = 400
+        with self.connection() as conn:
+            for i in range(0, len(items), chunk):
+                part = items[i : i + chunk]
+                placeholders = ",".join("?" for _ in part)
+                paths = [p[0] for p in part]
+                rows = conn.execute(
+                    f"SELECT * FROM media_meta WHERE remote_path IN ({placeholders})",
+                    paths,
+                ).fetchall()
+                wanted = {(p, s, m) for p, s, m in part}
+                for row in rows:
+                    key = (row["remote_path"], row["size"], row["mtime"])
+                    if key in wanted:
+                        result[row["remote_path"]] = dict(row)
+        return result
+
+    def upsert_media_meta(self, remote_path: str, size: int, mtime: int, **fields: Any) -> None:
+        now = _utc_now()
+        allowed = {
+            "width",
+            "height",
+            "duration_sec",
+            "mime_type",
+            "title",
+            "resolution",
+            "video_codec",
+            "audio_codec",
+            "bitrate",
+            "fps",
+            "pix_fmt",
+            "profile",
+            "level",
+            "source",
+        }
+        data = {k: v for k, v in fields.items() if k in allowed}
+        cols = ["remote_path", "size", "mtime", "updated_at", *data.keys()]
+        vals = [remote_path, size, mtime, now, *data.values()]
+        updates = ", ".join(
+            f"{c} = excluded.{c}" for c in ("size", "mtime", "updated_at", *data.keys())
+        )
+        placeholders = ", ".join("?" for _ in cols)
+        sql = (
+            f"INSERT INTO media_meta ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(remote_path) DO UPDATE SET {updates}"
+        )
+        with self.connection() as conn:
+            conn.execute(sql, vals)
+
+    def upsert_media_meta_batch(self, rows: list[dict[str, Any]]) -> int:
+        if not rows:
+            return 0
+        now = _utc_now()
+        with self.connection() as conn:
+            for row in rows:
+                self._upsert_media_meta_conn(conn, row, now)
+        return len(rows)
+
+    def _upsert_media_meta_conn(
+        self, conn: sqlite3.Connection, row: dict[str, Any], now: str
+    ) -> None:
+        remote_path = row["remote_path"]
+        size = int(row["size"])
+        mtime = int(row["mtime"])
+        fields = {
+            k: row.get(k)
+            for k in (
+                "width",
+                "height",
+                "duration_sec",
+                "mime_type",
+                "title",
+                "resolution",
+                "video_codec",
+                "audio_codec",
+                "bitrate",
+                "fps",
+                "pix_fmt",
+                "profile",
+                "level",
+                "source",
+            )
+            if k in row
+        }
+        cols = ["remote_path", "size", "mtime", "updated_at", *fields.keys()]
+        vals = [remote_path, size, mtime, now, *fields.values()]
+        updates = ", ".join(
+            f"{c} = excluded.{c}" for c in ("size", "mtime", "updated_at", *fields.keys())
+        )
+        placeholders = ", ".join("?" for _ in cols)
+        conn.execute(
+            f"INSERT INTO media_meta ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(remote_path) DO UPDATE SET {updates}",
+            vals,
+        )

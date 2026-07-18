@@ -153,8 +153,13 @@ def config_from_mapping(data: dict[str, Any], project_root: Path | None = None) 
         ffprobe_path=_as_optional_str(data.get("ffprobe_path")),
         output_suffix=str(data.get("output_suffix", defaults.output_suffix)),
         watch_interval_sec=watch_interval,
+        listing_cache_ttl_sec=float(
+            data.get("listing_cache_ttl_sec", defaults.listing_cache_ttl_sec)
+        ),
         project_root=root,
     )
+    if cfg.listing_cache_ttl_sec < 0:
+        raise ConfigError("listing_cache_ttl_sec must be >= 0")
     return cfg
 
 

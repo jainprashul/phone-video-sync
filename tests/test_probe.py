@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from phone_video_sync.ffmpeg import FFmpegError, parse_ffprobe_json
@@ -66,3 +68,17 @@ def test_parse_ffprobe_json_no_video_raises() -> None:
     }
     with pytest.raises(FFmpegError, match="No video stream"):
         parse_ffprobe_json(data, "audio.m4a")
+
+
+def test_write_head_tail_probe_file(tmp_path: Path) -> None:
+    from phone_video_sync.ffmpeg import write_head_tail_probe_file
+
+    dest = tmp_path / "probe.bin"
+    head = b"HEAD" + b"\x00" * 100
+    tail = b"TAIL" + b"\x11" * 50
+    total = 10_000
+    write_head_tail_probe_file(dest, head=head, tail=tail, total_size=total)
+    data = dest.read_bytes()
+    assert len(data) == total
+    assert data[: len(head)] == head
+    assert data[-len(tail) :] == tail
