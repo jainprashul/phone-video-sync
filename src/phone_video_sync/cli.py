@@ -68,10 +68,20 @@ def main(
 
 
 @app.command("scan")
-def scan_cmd(ctx: typer.Context) -> None:
-    """Discover videos on the phone and update SQLite (no transfers)."""
+def scan_cmd(
+    ctx: typer.Context,
+    select: bool = typer.Option(
+        False,
+        "--select",
+        "-s",
+        help="After the report, interactively choose folders/sizes/recommended to process",
+    ),
+) -> None:
+    """Discover videos and show a folder/size report (no transfers unless --select)."""
     pipeline = _pipeline(ctx, "scan")
-    pipeline.scan()
+    report = pipeline.scan(select=select)
+    if report.errors and report.failed and report.done == 0:
+        raise typer.Exit(code=1)
 
 
 @app.command("process")
@@ -81,10 +91,46 @@ def process_cmd(
     limit: Optional[int] = typer.Option(
         None, "--limit", help="Process at most N pending videos"
     ),
+    select: bool = typer.Option(
+        False,
+        "--select",
+        "-s",
+        help="Show report then interactively choose what to process",
+    ),
+    recommend: bool = typer.Option(
+        False,
+        "--recommend",
+        "-r",
+        help="Process only the recommended high-value set (≥100 MB / largest quartile)",
+    ),
+    folder: Optional[list[str]] = typer.Option(
+        None,
+        "--folder",
+        "-f",
+        help="Only process videos under this folder (repeatable)",
+    ),
+    min_size: Optional[str] = typer.Option(
+        None,
+        "--min-size",
+        help="Minimum file size (e.g. 100MB, 1G)",
+    ),
+    max_size: Optional[str] = typer.Option(
+        None,
+        "--max-size",
+        help="Maximum file size (e.g. 500MB)",
+    ),
 ) -> None:
     """Pull, compress, verify, push, and archive/delete originals."""
     pipeline = _pipeline(ctx, "process")
-    report = pipeline.process(yes=yes, limit=limit)
+    report = pipeline.process(
+        yes=yes,
+        limit=limit,
+        select=select,
+        folders=folder,
+        min_size=min_size,
+        max_size=max_size,
+        recommend=recommend,
+    )
     if report.errors and report.failed and report.done == 0:
         raise typer.Exit(code=1)
 
@@ -179,19 +225,35 @@ def run_cmd(
     limit: Optional[int] = typer.Option(
         None, "--limit", help="Process at most N pending videos (useful for testing)"
     ),
+    select: bool = typer.Option(False, "--select", "-s", help="Interactive selection"),
+    recommend: bool = typer.Option(False, "--recommend", "-r", help="Recommended set only"),
+    folder: Optional[list[str]] = typer.Option(None, "--folder", "-f", help="Folder filter"),
+    min_size: Optional[str] = typer.Option(None, "--min-size", help="Min size e.g. 100MB"),
+    max_size: Optional[str] = typer.Option(None, "--max-size", help="Max size e.g. 500MB"),
 ) -> None:
     """Alias for `process`."""
     pipeline = _pipeline(ctx, "run")
-    report = pipeline.process(yes=yes, limit=limit)
+    report = pipeline.process(
+        yes=yes,
+        limit=limit,
+        select=select,
+        folders=folder,
+        min_size=min_size,
+        max_size=max_size,
+        recommend=recommend,
+    )
     if report.errors and report.failed and report.done == 0:
         raise typer.Exit(code=1)
 
 
 @app.command("dry-run")
-def dry_run_cmd(ctx: typer.Context) -> None:
+def dry_run_cmd(
+    ctx: typer.Context,
+    select: bool = typer.Option(False, "--select", "-s", help="Interactive selection"),
+) -> None:
     """Alias for `scan`."""
     pipeline = _pipeline(ctx, "dry-run")
-    pipeline.scan()
+    pipeline.scan(select=select)
 
 
 @app.command("status")

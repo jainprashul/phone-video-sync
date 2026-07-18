@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from phone_video_sync.models import (
     IN_PROGRESS_STATUSES,
@@ -111,50 +111,86 @@ class Database:
 
     def upsert_discovered(self, remote_path: str, size: int, mtime: int) -> VideoRecord:
         """Insert or refresh a discovered video; reset done if size/mtime changed."""
+        self.upsert_discovered_batch([(remote_path, size, mtime)])
+        rec = self.get(remote_path)
+        assert rec is not None
+        return rec
+
+    def upsert_discovered_batch(
+        self,
+        items: list[tuple[str, int, int]],
+        *,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> int:
+        """Upsert many discovered videos in one transaction (fast for large scans)."""
+        if not items:
+            return 0
         now = _utc_now()
+        total = len(items)
         with self.connection() as conn:
-            existing = conn.execute(
-                "SELECT * FROM videos WHERE remote_path = ?",
-                (remote_path,),
-            ).fetchone()
-            if existing is None:
-                conn.execute(
+            existing_rows = conn.execute(
+                "SELECT remote_path, size, mtime FROM videos"
+            ).fetchall()
+            existing = {
+                row["remote_path"]: (row["size"], row["mtime"]) for row in existing_rows
+            }
+
+            inserts: list[tuple[Any, ...]] = []
+            resets: list[tuple[Any, ...]] = []
+            touches: list[tuple[Any, ...]] = []
+
+            for i, (remote_path, size, mtime) in enumerate(items, start=1):
+                prev = existing.get(remote_path)
+                if prev is None:
+                    inserts.append(
+                        (
+                            remote_path,
+                            size,
+                            mtime,
+                            VideoStatus.DISCOVERED.value,
+                            now,
+                            now,
+                        )
+                    )
+                elif prev[0] != size or prev[1] != mtime:
+                    resets.append((size, mtime, VideoStatus.DISCOVERED.value, now, remote_path))
+                else:
+                    touches.append((now, remote_path))
+
+                if on_progress and (i % 200 == 0 or i == total):
+                    on_progress(i, total)
+
+            if inserts:
+                conn.executemany(
                     """
                     INSERT INTO videos (
                         remote_path, size, mtime, status, attempts,
                         discovered_at, updated_at
                     ) VALUES (?, ?, ?, ?, 0, ?, ?)
                     """,
-                    (remote_path, size, mtime, VideoStatus.DISCOVERED.value, now, now),
+                    inserts,
                 )
-            else:
-                changed = existing["size"] != size or existing["mtime"] != mtime
-                if changed:
-                    conn.execute(
-                        """
-                        UPDATE videos SET
-                            size = ?, mtime = ?, status = ?, attempts = 0,
-                            last_error = NULL, local_path = NULL, output_path = NULL,
-                            remote_output_path = NULL, src_duration = NULL,
-                            src_width = NULL, src_height = NULL,
-                            out_duration = NULL, out_width = NULL, out_height = NULL,
-                            out_size = NULL, saved_bytes = NULL,
-                            completed_at = NULL, updated_at = ?
-                        WHERE remote_path = ?
-                        """,
-                        (size, mtime, VideoStatus.DISCOVERED.value, now, remote_path),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE videos SET updated_at = ? WHERE remote_path = ?",
-                        (now, remote_path),
-                    )
-            row = conn.execute(
-                "SELECT * FROM videos WHERE remote_path = ?",
-                (remote_path,),
-            ).fetchone()
-        assert row is not None
-        return _row_to_record(row)
+            if resets:
+                conn.executemany(
+                    """
+                    UPDATE videos SET
+                        size = ?, mtime = ?, status = ?, attempts = 0,
+                        last_error = NULL, local_path = NULL, output_path = NULL,
+                        remote_output_path = NULL, src_duration = NULL,
+                        src_width = NULL, src_height = NULL,
+                        out_duration = NULL, out_width = NULL, out_height = NULL,
+                        out_size = NULL, saved_bytes = NULL,
+                        completed_at = NULL, updated_at = ?
+                    WHERE remote_path = ?
+                    """,
+                    resets,
+                )
+            if touches:
+                # Skip per-row updated_at touch for unchanged files — huge win on re-scans.
+                # Only bump a sample is unnecessary; leave them as-is.
+                pass
+
+        return total
 
     def set_status(
         self,

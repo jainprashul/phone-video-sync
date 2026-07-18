@@ -16,6 +16,7 @@ from rich.progress import (
     TextColumn,
     TimeElapsedColumn,
 )
+from rich.status import Status
 from rich.table import Table
 
 from phone_video_sync.adb import AdbClient, DeviceError, RemoteFile
@@ -24,6 +25,13 @@ from phone_video_sync.db import Database
 from phone_video_sync.ffmpeg import encode, ensure_encoder_available, get_media_info
 from phone_video_sync.logging_setup import get_console
 from phone_video_sync.models import RunReport, VideoRecord, VideoStatus
+from phone_video_sync.report import (
+    ScanBreakdown,
+    build_scan_breakdown,
+    filter_pending,
+    format_bytes as _format_bytes,
+    parse_size,
+)
 from phone_video_sync.verify import check
 
 logger = logging.getLogger(__name__)
@@ -43,57 +51,83 @@ def _output_remote_path(remote_path: str, suffix: str) -> str:
     return f"{parent}/{stem}{suffix}.mp4"
 
 
-def _format_bytes(n: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(n)
-    for unit in units:
-        if value < 1024 or unit == units[-1]:
-            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
-        value /= 1024
-    return f"{n} B"
-
-
 class Pipeline:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         ensure_runtime_dirs(cfg)
         self.tools = resolve_tools(cfg)
         self.db = Database(cfg.db_path)
+        self.console = get_console()
+        self._status: Status | None = None
         self.adb = AdbClient(
             self.tools["adb"],
             timeout=min(cfg.subprocess_timeout_sec, 300),
+            on_progress=self._on_adb_progress,
         )
-        self.console = get_console()
+
+    def _on_adb_progress(self, message: str) -> None:
+        """Update live Rich status so long ADB calls don't look frozen."""
+        if self._status is not None:
+            self._status.update(f"[cyan]{message}[/cyan]")
+        else:
+            self.console.print(f"[dim]{message}[/dim]")
 
     def discover(self, *, require_encoder: bool = True) -> tuple[list[RemoteFile], list[VideoRecord]]:
-        device = self.adb.get_device()
-        self.adb.serial = device.serial
-        logger.info("Using device %s (%s)", device.serial, device.state)
+        with Status(
+            "[cyan]Connecting to device…[/cyan]",
+            console=self.console,
+            spinner="dots",
+        ) as status:
+            self._status = status
+            try:
+                device = self.adb.get_device()
+                self.adb.serial = device.serial
+                status.update(
+                    f"[cyan]Using device {device.serial} ({device.state})…[/cyan]"
+                )
+                logger.info("Using device %s (%s)", device.serial, device.state)
 
-        if require_encoder:
-            ensure_encoder_available(self.tools["ffmpeg"], self.cfg.video_encoder)
+                if require_encoder:
+                    status.update("[cyan]Checking encoder…[/cyan]")
+                    ensure_encoder_available(self.tools["ffmpeg"], self.cfg.video_encoder)
 
-        remote_files = self.adb.list_videos(
-            self.cfg.remote_root,
-            self.cfg.extensions,
-            self.cfg.skip_prefixes,
-            self.cfg.archive_root,
+                remote_files = self.adb.list_videos(
+                    self.cfg.remote_root,
+                    self.cfg.extensions,
+                    self.cfg.skip_prefixes,
+                    self.cfg.archive_root,
+                )
+                logger.info("Discovered %d remote video(s)", len(remote_files))
+
+                status.update(
+                    f"[cyan]Updating database ({len(remote_files)} files)…[/cyan]"
+                )
+                reset = self.db.reconcile_on_start()
+                if reset:
+                    logger.info("Reconciled %d interrupted job(s) for resume", reset)
+
+                def _db_progress(done: int, total: int) -> None:
+                    status.update(
+                        f"[cyan]Updating database… {done}/{total}[/cyan]"
+                    )
+
+                self.db.upsert_discovered_batch(
+                    [(rf.path, rf.size, rf.mtime) for rf in remote_files],
+                    on_progress=_db_progress,
+                )
+
+                status.update("[cyan]Computing pending work…[/cyan]")
+                pending = self.db.pending_work(self.cfg.max_attempts)
+                remote_set = {rf.path for rf in remote_files}
+                pending = [p for p in pending if p.remote_path in remote_set]
+                pending = [p for p in pending if p.status != VideoStatus.DONE]
+            finally:
+                self._status = None
+
+        self.console.print(
+            f"[green]Ready:[/green] {len(remote_files)} on device, "
+            f"{len(pending)} pending."
         )
-        logger.info("Discovered %d remote video(s)", len(remote_files))
-
-        reset = self.db.reconcile_on_start()
-        if reset:
-            logger.info("Reconciled %d interrupted job(s) for resume", reset)
-
-        for rf in remote_files:
-            self.db.upsert_discovered(rf.path, rf.size, rf.mtime)
-
-        pending = self.db.pending_work(self.cfg.max_attempts)
-        # Only process files that still exist on device among pending
-        remote_set = {rf.path for rf in remote_files}
-        pending = [p for p in pending if p.remote_path in remote_set]
-        # Skip already done (pending_work shouldn't include done)
-        pending = [p for p in pending if p.status != VideoStatus.DONE]
         return remote_files, pending
 
     def print_summary(
@@ -102,33 +136,176 @@ class Pipeline:
         pending: list[VideoRecord],
         *,
         title: str = "Dry-run summary",
-    ) -> None:
-        total_bytes = sum(p.size for p in pending)
-        # Rough estimate: ~40% of original for HEVC
-        est_out = int(total_bytes * 0.4)
-        table = Table(title=title)
-        table.add_column("Metric")
-        table.add_column("Value", justify="right")
-        table.add_row("Videos on device", str(len(remote_files)))
-        table.add_row("Pending / to process", str(len(pending)))
-        table.add_row("Pending bytes", _format_bytes(total_bytes))
-        table.add_row("Est. output (≈40%)", _format_bytes(est_out))
-        table.add_row("Est. savings", _format_bytes(max(0, total_bytes - est_out)))
-        table.add_row("Encoder", self.cfg.video_encoder)
-        table.add_row("Workers", str(self.cfg.encode_workers))
-        table.add_row("Delete mode", self.cfg.delete_mode)
-        self.console.print(table)
+    ) -> ScanBreakdown:
+        with Status(
+            f"[cyan]Building report for {len(pending)} pending video(s)…[/cyan]",
+            console=self.console,
+            spinner="dots",
+        ) as status:
+            self._status = status
+            try:
+                status.update("[cyan]Grouping by size and folder…[/cyan]")
+                breakdown = build_scan_breakdown(pending)
+                status.update("[cyan]Rendering tables…[/cyan]")
+            finally:
+                self._status = None
 
-        if pending:
-            preview = Table(title="Pending files (first 20)")
-            preview.add_column("Remote path")
-            preview.add_column("Size", justify="right")
-            preview.add_column("Status")
-            for item in pending[:20]:
-                preview.add_row(item.remote_path, _format_bytes(item.size), item.status.value)
-            if len(pending) > 20:
-                preview.add_row(f"... and {len(pending) - 20} more", "", "")
-            self.console.print(preview)
+        total_bytes = sum(p.size for p in pending)
+        est_out = int(total_bytes * 0.4)
+
+        overview = Table(title=title)
+        overview.add_column("Metric")
+        overview.add_column("Value", justify="right")
+        overview.add_row("Videos on device", str(len(remote_files)))
+        overview.add_row("Pending / to process", str(len(pending)))
+        overview.add_row("Pending bytes", _format_bytes(total_bytes))
+        overview.add_row("Est. output (≈40%)", _format_bytes(est_out))
+        overview.add_row("Est. savings", _format_bytes(max(0, total_bytes - est_out)))
+        overview.add_row("Encoder", self.cfg.video_encoder)
+        overview.add_row("Workers", str(self.cfg.encode_workers))
+        overview.add_row("Delete mode", self.cfg.delete_mode)
+        self.console.print(overview)
+
+        if not pending:
+            return breakdown
+
+        size_table = Table(title="Pending by size")
+        size_table.add_column("#", justify="right")
+        size_table.add_column("Bucket")
+        size_table.add_column("Files", justify="right")
+        size_table.add_column("Bytes", justify="right")
+        size_table.add_column("Est. save", justify="right")
+        for i, group in enumerate(breakdown.by_size, start=1):
+            size_table.add_row(
+                str(i),
+                group.key,
+                str(group.count),
+                _format_bytes(group.bytes),
+                _format_bytes(group.est_savings),
+            )
+        self.console.print(size_table)
+
+        folder_table = Table(title="Pending by folder (top 25)")
+        folder_table.add_column("#", justify="right")
+        folder_table.add_column("Folder")
+        folder_table.add_column("Files", justify="right")
+        folder_table.add_column("Bytes", justify="right")
+        folder_table.add_column("Est. save", justify="right")
+        for i, group in enumerate(breakdown.by_folder[:25], start=1):
+            folder_table.add_row(
+                str(i),
+                group.key,
+                str(group.count),
+                _format_bytes(group.bytes),
+                _format_bytes(group.est_savings),
+            )
+        if len(breakdown.by_folder) > 25:
+            folder_table.add_row(
+                "",
+                f"… and {len(breakdown.by_folder) - 25} more folders",
+                "",
+                "",
+                "",
+            )
+        self.console.print(folder_table)
+
+        rec_bytes = sum(r.size for r in breakdown.recommended)
+        rec_table = Table(title="Recommendation")
+        rec_table.add_column("Detail")
+        rec_table.add_row(breakdown.recommend_reason)
+        rec_table.add_row(
+            f"[bold]Recommended set:[/bold] {len(breakdown.recommended)} file(s), "
+            f"{_format_bytes(rec_bytes)} "
+            f"(est. save {_format_bytes(int(rec_bytes * 0.6))})"
+        )
+        self.console.print(rec_table)
+
+        if breakdown.recommended:
+            top = Table(title="Recommended files (largest first, up to 15)")
+            top.add_column("Size", justify="right")
+            top.add_column("Folder")
+            top.add_column("File")
+            for item in sorted(breakdown.recommended, key=lambda r: r.size, reverse=True)[:15]:
+                parent = str(Path(item.remote_path).parent).replace("\\", "/")
+                top.add_row(
+                    _format_bytes(item.size),
+                    parent,
+                    Path(item.remote_path).name,
+                )
+            if len(breakdown.recommended) > 15:
+                top.add_row("", "", f"… and {len(breakdown.recommended) - 15} more")
+            self.console.print(top)
+
+        return breakdown
+
+    def interactive_select(self, breakdown: ScanBreakdown) -> list[VideoRecord] | None:
+        """Prompt user to choose a processing subset. Returns None if cancelled."""
+        if not breakdown.pending:
+            return []
+
+        self.console.print()
+        self.console.print("[bold]Select what to process[/bold]")
+        self.console.print("  [cyan]r[/cyan]  recommended set")
+        self.console.print("  [cyan]a[/cyan]  all pending")
+        self.console.print("  [cyan]f[/cyan]  pick folder(s) by number")
+        self.console.print("  [cyan]s[/cyan]  pick size bucket(s) by number")
+        self.console.print("  [cyan]q[/cyan]  quit (scan only)")
+        choice = self.console.input("Choice [r/a/f/s/q]: ").strip().lower()
+
+        if choice in {"", "q", "n", "no"}:
+            return None
+        if choice in {"r", "rec", "recommended"}:
+            return list(breakdown.recommended)
+        if choice in {"a", "all"}:
+            return list(breakdown.pending)
+
+        if choice in {"f", "folder", "folders"}:
+            self.console.print("Enter folder numbers (comma-separated), e.g. 1,3,5")
+            raw = self.console.input("Folders: ").strip()
+            if not raw:
+                return None
+            try:
+                idxs = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                self.console.print("[red]Invalid folder numbers.[/red]")
+                return None
+            selected: list[VideoRecord] = []
+            for idx in idxs:
+                if 1 <= idx <= len(breakdown.by_folder):
+                    selected.extend(breakdown.by_folder[idx - 1].records)
+            # de-dupe preserving order
+            seen: set[str] = set()
+            unique: list[VideoRecord] = []
+            for rec in selected:
+                if rec.remote_path not in seen:
+                    seen.add(rec.remote_path)
+                    unique.append(rec)
+            return unique
+
+        if choice in {"s", "size", "sizes"}:
+            self.console.print("Enter size bucket numbers (comma-separated), e.g. 3,4,5")
+            raw = self.console.input("Buckets: ").strip()
+            if not raw:
+                return None
+            try:
+                idxs = [int(x.strip()) for x in raw.split(",") if x.strip()]
+            except ValueError:
+                self.console.print("[red]Invalid bucket numbers.[/red]")
+                return None
+            selected = []
+            for idx in idxs:
+                if 1 <= idx <= len(breakdown.by_size):
+                    selected.extend(breakdown.by_size[idx - 1].records)
+            seen = set()
+            unique = []
+            for rec in selected:
+                if rec.remote_path not in seen:
+                    seen.add(rec.remote_path)
+                    unique.append(rec)
+            return unique
+
+        self.console.print("[red]Unknown choice.[/red]")
+        return None
 
     def process_one(self, record: VideoRecord) -> None:
         """Pull → encode → verify → push → archive/delete. Raises on failure."""
@@ -230,6 +407,11 @@ class Pipeline:
         dry_run: bool = False,
         yes: bool = False,
         limit: int | None = None,
+        select: bool = False,
+        folders: list[str] | None = None,
+        min_size: str | None = None,
+        max_size: str | None = None,
+        recommend: bool = False,
     ) -> RunReport:
         report = RunReport()
         try:
@@ -239,6 +421,16 @@ class Pipeline:
             report.errors.append(str(exc))
             return report
 
+        min_bytes = parse_size(min_size) if min_size else None
+        max_bytes = parse_size(max_size) if max_size else None
+        pending = filter_pending(
+            pending,
+            folders=folders,
+            min_bytes=min_bytes,
+            max_bytes=max_bytes,
+            recommended_only=recommend,
+        )
+
         if limit is not None:
             pending = pending[:limit]
 
@@ -246,15 +438,43 @@ class Pipeline:
         counts = self.db.count_by_status()
         report.skipped = counts.get(VideoStatus.DONE.value, 0)
 
-        self.print_summary(
+        breakdown = self.print_summary(
             remote_files,
             pending,
-            title="Scan summary" if dry_run else "Process plan",
+            title="Scan report" if dry_run else "Process plan",
         )
 
-        if dry_run:
-            self.console.print("[cyan]Scan only — no pull/push/delete performed.[/cyan]")
+        if dry_run and not select:
+            self.console.print(
+                "[cyan]Scan only — no pull/push/delete. "
+                "Use [bold]phone-sync scan --select[/bold] to choose a subset, "
+                "or [bold]phone-sync process --recommend[/bold].[/cyan]"
+            )
             return report
+
+        if select:
+            chosen = self.interactive_select(breakdown)
+            if chosen is None:
+                self.console.print("[yellow]No selection — aborted.[/yellow]")
+                return report
+            pending = chosen
+            if not pending:
+                self.console.print("[green]Nothing selected.[/green]")
+                return report
+            self.console.print(
+                f"[cyan]Selected {len(pending)} file(s) "
+                f"({_format_bytes(sum(p.size for p in pending))}).[/cyan]"
+            )
+            if dry_run:
+                # scan --select: ask whether to process now
+                go = self.console.input("Process selected files now? [y/N] ").strip().lower()
+                if go not in {"y", "yes"}:
+                    self.console.print(
+                        "[cyan]Selection noted in report only — run process with filters later.[/cyan]"
+                    )
+                    return report
+                # fall through to process selected
+                yes = True
 
         if not pending:
             self.console.print("[green]Nothing to process.[/green]")
@@ -325,13 +545,32 @@ class Pipeline:
         self._print_report(report)
         return report
 
-    def scan(self) -> RunReport:
-        """Discover videos and update SQLite without transferring."""
-        return self.run(dry_run=True, yes=True)
+    def scan(self, *, select: bool = False) -> RunReport:
+        """Discover videos and update SQLite without transferring (unless --select processes)."""
+        return self.run(dry_run=True, yes=True, select=select)
 
-    def process(self, *, yes: bool = False, limit: int | None = None) -> RunReport:
+    def process(
+        self,
+        *,
+        yes: bool = False,
+        limit: int | None = None,
+        select: bool = False,
+        folders: list[str] | None = None,
+        min_size: str | None = None,
+        max_size: str | None = None,
+        recommend: bool = False,
+    ) -> RunReport:
         """Pull, encode, verify, push, and archive/delete originals."""
-        return self.run(dry_run=False, yes=yes, limit=limit)
+        return self.run(
+            dry_run=False,
+            yes=yes,
+            limit=limit,
+            select=select,
+            folders=folders,
+            min_size=min_size,
+            max_size=max_size,
+            recommend=recommend,
+        )
 
     def watch(
         self,

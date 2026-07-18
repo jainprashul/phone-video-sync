@@ -107,3 +107,31 @@ def test_failed_records(tmp_path: Path) -> None:
     failed = db.failed_records()
     assert len(failed) == 1
     assert failed[0].last_error == "encode error"
+
+
+def test_upsert_batch(tmp_path: Path) -> None:
+    db = Database(tmp_path / "t.db")
+    progress: list[tuple[int, int]] = []
+    n = db.upsert_discovered_batch(
+        [
+            ("/sdcard/a.mp4", 100, 1),
+            ("/sdcard/b.mp4", 200, 2),
+            ("/sdcard/c.mp4", 300, 3),
+        ],
+        on_progress=lambda d, t: progress.append((d, t)),
+    )
+    assert n == 3
+    assert db.get("/sdcard/b.mp4") is not None
+    assert db.get("/sdcard/b.mp4").size == 200  # type: ignore[union-attr]
+    # Unchanged re-upsert should not reset done
+    db.record_result(
+        "/sdcard/a.mp4",
+        out_size=40,
+        saved_bytes=60,
+        remote_output_path="/sdcard/a_hevc.mp4",
+    )
+    db.upsert_discovered_batch([("/sdcard/a.mp4", 100, 1)])
+    assert db.get("/sdcard/a.mp4").status.value == "done"  # type: ignore[union-attr]
+    # Changed size resets
+    db.upsert_discovered_batch([("/sdcard/a.mp4", 999, 1)])
+    assert db.get("/sdcard/a.mp4").status.value == "discovered"  # type: ignore[union-attr]

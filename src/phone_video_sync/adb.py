@@ -5,11 +5,16 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+ProgressFn = Callable[[str], None]
 
 
 class AdbError(Exception):
@@ -40,10 +45,22 @@ class AdbClient:
         *,
         serial: str | None = None,
         timeout: int = 120,
+        on_progress: ProgressFn | None = None,
     ) -> None:
         self.adb_path = adb_path
         self.serial = serial
         self.timeout = timeout
+        self.on_progress = on_progress
+
+    def _notify(self, message: str) -> None:
+        if self.on_progress:
+            logger.debug("%s", message)
+            try:
+                self.on_progress(message)
+            except Exception:  # noqa: BLE001 — never break ADB on UI callback
+                logger.debug("progress callback failed", exc_info=True)
+        else:
+            logger.info("%s", message)
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.adb_path]
@@ -57,21 +74,59 @@ class AdbClient:
         *,
         timeout: int | None = None,
         check: bool = True,
+        stream_stderr: bool = False,
+        label: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         cmd = self._base_cmd() + args
         logger.debug("ADB: %s", " ".join(cmd))
+        if label:
+            self._notify(label)
+
+        wait = timeout or self.timeout
+        stop_heartbeat = threading.Event()
+
+        def _heartbeat() -> None:
+            started = time.monotonic()
+            # First tick after 5s so short commands stay quiet
+            if not stop_heartbeat.wait(5.0):
+                while not stop_heartbeat.wait(10.0):
+                    elapsed = int(time.monotonic() - started)
+                    self._notify(
+                        f"Still working… {label or args[0]} ({elapsed}s elapsed)"
+                    )
+
+        heart: threading.Thread | None = None
+        if wait >= 30:
+            heart = threading.Thread(target=_heartbeat, daemon=True)
+            heart.start()
+
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout or self.timeout,
-                check=False,
-            )
+            if stream_stderr:
+                # Let ADB print transfer progress to the terminal (stderr).
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    text=True,
+                    timeout=wait,
+                    check=False,
+                )
+            else:
+                result = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=wait,
+                    check=False,
+                )
         except subprocess.TimeoutExpired as exc:
-            raise AdbError(f"ADB timed out: {' '.join(cmd)}") from exc
+            raise AdbError(f"ADB timed out after {wait}s: {' '.join(cmd)}") from exc
         except FileNotFoundError as exc:
             raise AdbError(f"ADB binary not found: {self.adb_path}") from exc
+        finally:
+            stop_heartbeat.set()
+            if heart is not None:
+                heart.join(timeout=0.2)
 
         if check and result.returncode != 0:
             detail = (result.stderr or result.stdout or "").strip()
@@ -84,12 +139,18 @@ class AdbClient:
         *,
         timeout: int | None = None,
         check: bool = True,
+        label: str | None = None,
     ) -> str:
-        result = self.run(["shell", command], timeout=timeout, check=check)
+        result = self.run(
+            ["shell", command],
+            timeout=timeout,
+            check=check,
+            label=label,
+        )
         return result.stdout or ""
 
     def devices(self) -> list[DeviceInfo]:
-        result = self.run(["devices"], check=True)
+        result = self.run(["devices"], check=True, label="Checking ADB devices…")
         devices: list[DeviceInfo] = []
         for line in result.stdout.splitlines():
             line = line.strip()
@@ -158,53 +219,73 @@ class AdbClient:
         skip_prefixes: list[str],
         archive_root: str,
     ) -> list[RemoteFile]:
-        """Recursively list video files under remote_root via adb shell find.
+        """Recursively list video files under remote_root via a single adb find.
 
-        Uses plain ``-name`` patterns (Android toybox often lacks ``-iname``)
-        and batches ``stat`` via ``find -exec`` to avoid per-file round-trips.
-        Resolves ``/sdcard`` symlinks because ``find`` often skips them.
+        One filesystem walk (not per-extension) with a Rich/heartbeat progress
+        so the CLI does not look frozen during long scans.
         """
+        self._notify("Resolving device storage path…")
         root = self.resolve_path(remote_root)
         archive_norm = self.resolve_path(archive_root)
         ext_set = {ext.lstrip(".").lower() for ext in extensions}
 
-        # Lines: SIZE MTIME PATH  (path may contain spaces)
-        # Prune Android/ to avoid permission errors and huge app caches.
-        raw_lines: list[str] = []
+        name_clauses: list[str] = []
         for ext in sorted(ext_set):
-            for pattern in (f"*.{ext}", f"*.{ext.upper()}"):
-                find_cmd = (
-                    f"find {root} "
-                    f"\\( -path {root}/Android -o -path '{root}/Android/*' \\) -prune -o "
-                    f"-type f -name '{pattern}' "
-                    f"-exec stat -c '%s %Y %n' {{}} \\; "
-                    f"2>/dev/null"
-                )
-                try:
-                    # find often exits non-zero on permission denials; keep stdout
-                    stdout = self.shell(
-                        find_cmd,
-                        timeout=max(self.timeout, 900),
-                        check=False,
-                    )
-                except AdbError as exc:
-                    logger.warning("find failed for %s: %s", pattern, exc)
-                    continue
-                raw_lines.extend(stdout.splitlines())
+            name_clauses.append(f"-name '*.{ext}'")
+            name_clauses.append(f"-name '*.{ext.upper()}'")
+        name_expr = " -o ".join(name_clauses)
 
+        # Single walk of the tree — previously we ran ~12 separate finds.
+        find_cmd = (
+            f"find {root} "
+            f"\\( -path {root}/Android -o -path '{root}/Android/*' \\) -prune -o "
+            f"-type f \\( {name_expr} \\) "
+            f"-printf '%s %T@ %p\\n' "
+            f"2>/dev/null"
+        )
+
+        self._notify(
+            f"Scanning {root} for videos (one pass — can take 1–5+ min on large storage)…"
+        )
+        stdout = self.shell(
+            find_cmd,
+            timeout=max(self.timeout, 900),
+            check=False,
+            label=f"adb find under {root}",
+        )
+
+        # Fallback if -printf is unsupported (rare on modern Android toybox)
+        if not stdout.strip():
+            self._notify("Retrying scan with find -exec stat (slower fallback)…")
+            find_cmd = (
+                f"find {root} "
+                f"\\( -path {root}/Android -o -path '{root}/Android/*' \\) -prune -o "
+                f"-type f \\( {name_expr} \\) "
+                f"-exec stat -c '%s %Y %n' {{}} \\; "
+                f"2>/dev/null"
+            )
+            stdout = self.shell(
+                find_cmd,
+                timeout=max(self.timeout, 900),
+                check=False,
+                label=f"adb find+stat under {root}",
+            )
+
+        self._notify("Parsing scan results…")
         skip = [p.lstrip("/") for p in skip_prefixes]
         files: list[RemoteFile] = []
         seen: set[str] = set()
 
-        for line in raw_lines:
+        for line in stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
-            match = re.match(r"^(\d+)\s+(\d+)\s+(.+)$", line)
+            # %T@ may be float; accept int or float mtime
+            match = re.match(r"^(\d+)\s+(\d+(?:\.\d+)?)\s+(.+)$", line)
             if not match:
                 continue
             size = int(match.group(1))
-            mtime = int(match.group(2))
+            mtime = int(float(match.group(2)))
             path = match.group(3).strip().replace("\\", "/")
             if not path.startswith("/"):
                 path = "/" + path
@@ -229,26 +310,19 @@ class AdbClient:
             files.append(RemoteFile(path=path, size=size, mtime=mtime))
 
         files.sort(key=lambda f: f.path)
+        self._notify(f"Scan complete — {len(files)} video file(s) found.")
         return files
-
-    def _stat_file(self, remote_path: str) -> tuple[int, int]:
-        # BusyBox/toybox: stat -c '%s %Y'
-        quoted = _shell_quote(remote_path)
-        out = self.shell(f"stat -c '%s %Y' {quoted}").strip()
-        match = re.match(r"^(\d+)\s+(\d+)$", out)
-        if not match:
-            # Fallback: ls -l parsing is fragile; try toybox stat alternate
-            out2 = self.shell(f"ls -ln {quoted}").strip()
-            raise AdbError(f"Could not stat {remote_path}: {out or out2}")
-        return int(match.group(1)), int(match.group(2))
 
     def pull(self, remote_path: str, local_path: Path, *, timeout: int | None = None) -> None:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         if local_path.exists():
             local_path.unlink()
+        name = Path(remote_path).name
         self.run(
             ["pull", remote_path, str(local_path)],
             timeout=timeout or max(self.timeout, 600),
+            stream_stderr=True,
+            label=f"Pulling {name}…",
         )
         if not local_path.is_file():
             raise AdbError(f"Pull did not create local file: {local_path}")
@@ -257,10 +331,13 @@ class AdbClient:
         if not local_path.is_file():
             raise AdbError(f"Local file missing for push: {local_path}")
         remote_dir = remote_path.rsplit("/", 1)[0]
-        self.shell(f"mkdir -p {_shell_quote(remote_dir)}")
+        self.shell(f"mkdir -p {_shell_quote(remote_dir)}", label=None)
+        name = Path(remote_path).name
         self.run(
             ["push", str(local_path), remote_path],
             timeout=timeout or max(self.timeout, 600),
+            stream_stderr=True,
+            label=f"Pushing {name}…",
         )
 
     def move_to_archive(self, remote_path: str, archive_root: str, remote_root: str) -> str:
@@ -275,11 +352,17 @@ class AdbClient:
         dest = f"{archive_root.rstrip('/')}/{rel}"
         dest_dir = dest.rsplit("/", 1)[0]
         self.shell(f"mkdir -p {_shell_quote(dest_dir)}")
-        self.shell(f"mv {_shell_quote(remote_path)} {_shell_quote(dest)}")
+        self.shell(
+            f"mv {_shell_quote(remote_path)} {_shell_quote(dest)}",
+            label=f"Archiving {Path(remote_path).name}…",
+        )
         return dest
 
     def delete_remote(self, remote_path: str) -> None:
-        self.shell(f"rm -f {_shell_quote(remote_path)}")
+        self.shell(
+            f"rm -f {_shell_quote(remote_path)}",
+            label=f"Deleting {Path(remote_path).name}…",
+        )
 
     def set_remote_mtime(self, remote_path: str, mtime: int) -> None:
         # touch -d @epoch works on many Android shells; fallback to touch -t
@@ -311,7 +394,10 @@ class AdbClient:
             "/storage/self/primary",
         }:
             raise AdbError(f"Refusing to purge unsafe archive_root: {archive_root}")
-        self.shell(f"rm -rf {_shell_quote(root)}")
+        self.shell(
+            f"rm -rf {_shell_quote(root)}",
+            label=f"Purging archive {root}…",
+        )
 
 
 def _shell_quote(path: str) -> str:

@@ -28,8 +28,18 @@ cp config.yaml.example config.yaml
 ## Usage
 
 ```bash
-# Discover videos and update SQLite (no transfers)
+# Discover videos — folder + size report + recommendation
 phone-sync scan
+
+# Interactively pick recommended / folders / size buckets (optionally process)
+phone-sync scan --select
+
+# Compress only the recommended high-value set
+phone-sync process --recommend --yes
+
+# Or filter by folder / size
+phone-sync process --folder /storage/emulated/0/DCIM/Camera --min-size 100MB
+phone-sync process --select
 
 # Compress, verify, push, archive/delete (prompts unless --yes)
 phone-sync process
