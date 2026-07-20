@@ -335,5 +335,10 @@ def config_validate(ctx: typer.Context) -> None:
     console.print("[green]Configuration OK[/green]")
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console entry point for ``phone-sync`` and PyInstaller builds."""
     app()
+
+
+if __name__ == "__main__":
+    main()

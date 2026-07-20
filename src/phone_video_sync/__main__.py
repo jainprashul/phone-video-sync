@@ -1,6 +1,6 @@
 """Allow `python -m phone_video_sync`."""
 
-from phone_video_sync.cli import app
+from phone_video_sync.cli import main
 
 if __name__ == "__main__":
-    app()
+    main()
