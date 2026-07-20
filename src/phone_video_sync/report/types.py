@@ -92,4 +92,5 @@ class ScanBreakdown:
     by_size: list[GroupStats]
     recommended: list[VideoRecord]
     recommend_reason: str
+    failed: list[VideoRecord] = field(default_factory=list)
     metas: dict[str, FileMeta] = field(default_factory=dict)

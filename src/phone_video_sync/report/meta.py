@@ -139,6 +139,33 @@ def apply_remote_map(
         )
 
 
+def attach_failed_records(
+    breakdown: ScanBreakdown,
+    failed: list[VideoRecord],
+    remote_by_path: dict[str, Any],
+    *,
+    output_suffix: str,
+) -> None:
+    """Attach on-device failed records and ensure they have display metadata."""
+    breakdown.failed = failed
+    rec_paths = {r.remote_path for r in breakdown.recommended}
+    for rec in failed:
+        if rec.remote_path in breakdown.metas:
+            meta = breakdown.metas[rec.remote_path]
+            meta.status = (
+                rec.status.value if hasattr(rec.status, "value") else str(rec.status)
+            )
+            meta.attempts = rec.attempts
+            continue
+        remote = remote_by_path.get(rec.remote_path)
+        breakdown.metas[rec.remote_path] = build_file_meta(
+            rec,
+            recommended_paths=rec_paths,
+            output_suffix=output_suffix,
+            remote=remote,
+        )
+
+
 def apply_probe_to_meta(
     breakdown: ScanBreakdown,
     remote_path: str,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from math import log10
 
-from phone_video_sync.models import VideoRecord
+from phone_video_sync.models import VideoRecord, VideoStatus
 from phone_video_sync.report.format import folder_of, format_bytes, size_bucket_of
 from phone_video_sync.report.types import (
     FileMeta,
@@ -119,6 +119,9 @@ def recommendation_score(
 
     # Folder (camera-roll preference)
     score += max(0.0, 20.0 - 4.0 * folder_priority(rec.remote_path))
+
+    if rec.status == VideoStatus.FAILED:
+        score += 40.0
 
     if meta is None:
         return score

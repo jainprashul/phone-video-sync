@@ -16,6 +16,7 @@ from phone_video_sync.report.grouping import group_records
 from phone_video_sync.report.meta import (
     apply_probe_to_meta,
     apply_remote_map,
+    attach_failed_records,
     build_file_meta,
 )
 from phone_video_sync.report.recommend import (
@@ -48,6 +49,7 @@ __all__ = [
     "choice_label",
     "apply_remote_map",
     "apply_probe_to_meta",
+    "attach_failed_records",
     "recommendation_score",
     "recommend",
     "refresh_recommendations",

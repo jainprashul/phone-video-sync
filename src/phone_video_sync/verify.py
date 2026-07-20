@@ -3,8 +3,47 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from phone_video_sync.models import Config, MediaInfo, VerifyResult
+
+
+def _display_dimensions(info: MediaInfo) -> tuple[int, int]:
+    """Return (width, height) after applying any rotation metadata.
+
+    Phone videos are often stored with coded dimensions 1920x1080 plus a
+    rotate=90 tag (or side_data display matrix).  Some ffprobe versions report
+    the coded dimensions; others report the display-rotated ones.  Normalising
+    both src and output to display dimensions before comparing avoids false
+    resolution-mismatch failures.
+    """
+    w, h = info.width, info.height
+    raw: dict[str, Any] = info.raw or {}
+    streams: list[dict[str, Any]] = raw.get("streams") or []
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        return w, h
+
+    # 1) Explicit rotate tag (most Android phones)
+    try:
+        rotate = int((video.get("tags") or {}).get("rotate", 0))
+    except (TypeError, ValueError):
+        rotate = 0
+
+    # 2) side_data_list display matrix (newer ffprobe / H.265 container)
+    if rotate == 0:
+        for sd in video.get("side_data_list") or []:
+            if sd.get("side_data_type") == "Display Matrix":
+                try:
+                    rotate = int(sd.get("rotation", 0))
+                except (TypeError, ValueError):
+                    pass
+
+    # Normalise negative angles (-90 == 270)
+    rotate = rotate % 360
+    if rotate in {90, 270}:
+        return h, w
+    return w, h
 
 
 def check(
@@ -19,10 +58,13 @@ def check(
 
     if out.width <= 0 or out.height <= 0:
         reasons.append("output has invalid resolution")
-    elif (out.width, out.height) != (src.width, src.height):
-        reasons.append(
-            f"resolution mismatch: src={src.width}x{src.height} out={out.width}x{out.height}"
-        )
+    else:
+        src_display = _display_dimensions(src)
+        out_display = _display_dimensions(out)
+        if out_display != src_display:
+            reasons.append(
+                f"resolution mismatch: src={src.width}x{src.height} out={out.width}x{out.height}"
+            )
 
     duration_delta = abs(out.duration_sec - src.duration_sec)
     if duration_delta > cfg.duration_tolerance_sec:

@@ -39,6 +39,7 @@ from phone_video_sync.pipeline.probe import probe_breakdown_codecs
 from phone_video_sync.report import (
     ScanBreakdown,
     apply_remote_map,
+    attach_failed_records,
     build_scan_breakdown,
     filter_pending,
     format_bytes,
@@ -237,6 +238,18 @@ class Pipeline:
                     "[cyan]Scoring recommendations (codec/resolution/size)…[/cyan]"
                 )
                 refresh_recommendations(breakdown, output_suffix=self.cfg.output_suffix)
+                remote_set = {rf.path for rf in remote_files}
+                failed_on_device = [
+                    rec
+                    for rec in self.db.failed_records()
+                    if rec.remote_path in remote_set
+                ]
+                attach_failed_records(
+                    breakdown,
+                    failed_on_device,
+                    remote_by_path,
+                    output_suffix=self.cfg.output_suffix,
+                )
                 status.update("[cyan]Rendering tables…[/cyan]")
             finally:
                 self._status = None
@@ -251,6 +264,7 @@ class Pipeline:
             encoder=self.cfg.video_encoder,
             encode_workers=self.cfg.encode_workers,
             delete_mode=self.cfg.delete_mode,
+            max_attempts=self.cfg.max_attempts,
         )
 
         report_path = save_scan_report(
@@ -262,12 +276,17 @@ class Pipeline:
             output_suffix=self.cfg.output_suffix,
             encoder=self.cfg.video_encoder,
             delete_mode=self.cfg.delete_mode,
+            max_attempts=self.cfg.max_attempts,
         )
         self.console.print(f"[green]Report saved:[/green] {report_path}")
         if breakdown.recommended:
             csv_sibling = report_path.with_name(report_path.stem + "-recommended.csv")
             if csv_sibling.exists():
                 self.console.print(f"[green]CSV saved:[/green] {csv_sibling}")
+        if breakdown.failed:
+            failed_csv = report_path.with_name(report_path.stem + "-failed.csv")
+            if failed_csv.exists():
+                self.console.print(f"[yellow]Failed CSV saved:[/yellow] {failed_csv}")
 
         return breakdown
 

@@ -182,6 +182,54 @@ def render_recommended_meta_table(
     console.print(table)
 
 
+def render_failed_meta_table(
+    console: Console,
+    breakdown: ScanBreakdown,
+    *,
+    max_attempts: int,
+) -> None:
+    """Failed videos still on device (includes exhausted retries)."""
+    if not breakdown.failed:
+        return
+
+    table = Table(
+        title=(
+            f"Failed / not processed ({len(breakdown.failed)}) — "
+            "needs attention or manual retry"
+        ),
+        show_lines=False,
+    )
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Attempts", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Dur")
+    table.add_column("Quality")
+    table.add_column("Resolution")
+    table.add_column("V-Codec")
+    table.add_column("Modified")
+    table.add_column("Name")
+    table.add_column("Error")
+
+    for i, rec in enumerate(breakdown.failed, start=1):
+        meta = breakdown.metas.get(rec.remote_path)
+        attempts = f"{rec.attempts}/{max_attempts}"
+        if rec.attempts >= max_attempts:
+            attempts = f"[red]{attempts}[/red]"
+        table.add_row(
+            str(i),
+            attempts,
+            meta.size_label if meta else format_bytes(rec.size),
+            meta.duration_label if meta else "?",
+            meta.quality if meta else "?",
+            meta.resolution if meta else "?",
+            _format_vcodec(meta) if meta else "?",
+            meta.modified if meta else "?",
+            meta.name if meta else rec.remote_path.rsplit("/", 1)[-1],
+            (rec.last_error or "?")[:120],
+        )
+    console.print(table)
+
+
 def render_scan_report(
     console: Console,
     *,
@@ -193,6 +241,7 @@ def render_scan_report(
     encoder: str,
     encode_workers: int,
     delete_mode: str,
+    max_attempts: int,
 ) -> None:
     """Render the full scan / dry-run report to the console."""
     render_scan_overview(
@@ -205,10 +254,9 @@ def render_scan_report(
         encode_workers=encode_workers,
         delete_mode=delete_mode,
     )
-    if not pending:
-        return
-
-    render_size_breakdown(console, breakdown)
-    render_folder_breakdown(console, breakdown)
-    render_recommendation_summary(console, breakdown)
-    render_recommended_meta_table(console, breakdown, output_suffix=output_suffix)
+    if pending:
+        render_size_breakdown(console, breakdown)
+        render_folder_breakdown(console, breakdown)
+        render_recommendation_summary(console, breakdown)
+        render_recommended_meta_table(console, breakdown, output_suffix=output_suffix)
+    render_failed_meta_table(console, breakdown, max_attempts=max_attempts)

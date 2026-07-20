@@ -23,6 +23,7 @@ def save_scan_report(
     output_suffix: str,
     encoder: str,
     delete_mode: str,
+    max_attempts: int = 3,
 ) -> Path:
     """Write a markdown scan report under log_dir; return the path."""
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -32,6 +33,7 @@ def save_scan_report(
     total_bytes = sum(p.size for p in pending)
     est_out = int(total_bytes * 0.4)
     rec_bytes = sum(r.size for r in breakdown.recommended)
+    failed_bytes = sum(r.size for r in breakdown.failed)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     lines: list[str] = [
@@ -46,6 +48,8 @@ def save_scan_report(
         f"| Videos on device | {len(remote_files)} |",
         f"| Pending | {len(pending)} |",
         f"| Pending bytes | {format_bytes(total_bytes)} |",
+        f"| Failed on device | {len(breakdown.failed)} |",
+        f"| Failed bytes | {format_bytes(failed_bytes)} |",
         f"| Est. output (~40%) | {format_bytes(est_out)} |",
         f"| Est. savings | {format_bytes(max(0, total_bytes - est_out))} |",
         f"| Output suffix | `{output_suffix}` |",
@@ -155,6 +159,65 @@ def save_scan_report(
             ]
         )
 
+    if breakdown.failed:
+        lines.extend(
+            [
+                "## Failed / not processed",
+                "",
+                f"**Failed set:** {len(breakdown.failed)} file(s), "
+                f"{format_bytes(failed_bytes)} "
+                f"(exhausted retries or last run failed)",
+                "",
+                "| # | Attempts | Size | Dur | Quality | Resolution | V-Codec | "
+                "Modified | Name | Output | Folder | Path | Error |",
+                "|--:|---------:|-----:|----:|---------|------------|---------|"
+                "----------|------|--------|--------|------|-------|",
+            ]
+        )
+        for i, rec in enumerate(breakdown.failed, start=1):
+            meta = breakdown.metas.get(rec.remote_path)
+            if not meta:
+                continue
+            vcodec = meta.video_codec or "?"
+            if meta.pix_fmt:
+                vcodec = f"{vcodec}/{meta.pix_fmt}"
+            attempts = f"{rec.attempts}/{max_attempts}"
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(i),
+                        attempts,
+                        meta.size_label,
+                        meta.duration_label,
+                        meta.quality,
+                        meta.resolution,
+                        vcodec,
+                        meta.modified,
+                        f"`{meta.name}`",
+                        f"`{meta.output_name}`",
+                        f"`{meta.folder}`",
+                        f"`{meta.remote_path}`",
+                        (rec.last_error or "?").replace("|", "\\|"),
+                    ]
+                )
+                + " |"
+            )
+
+        failed_csv = log_dir / f"report-{ts}-failed.csv"
+        _write_failed_csv(
+            failed_csv,
+            breakdown,
+            max_attempts=max_attempts,
+        )
+        lines.extend(
+            [
+                "",
+                f"CSV (failed only): `{failed_csv.name}`",
+                "",
+            ]
+        )
+
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
 
@@ -218,5 +281,63 @@ def _write_recommended_csv(
                     meta.folder,
                     meta.remote_path,
                     meta.status,
+                ]
+            )
+
+
+def _write_failed_csv(
+    path: Path,
+    breakdown: ScanBreakdown,
+    *,
+    max_attempts: int,
+) -> None:
+    with path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "attempts",
+                "max_attempts",
+                "size_bytes",
+                "size",
+                "duration",
+                "quality",
+                "resolution",
+                "video_codec",
+                "audio_codec",
+                "bitrate",
+                "fps",
+                "modified",
+                "name",
+                "output_name",
+                "folder",
+                "remote_path",
+                "status",
+                "last_error",
+            ]
+        )
+        for rec in breakdown.failed:
+            meta = breakdown.metas.get(rec.remote_path)
+            if not meta:
+                continue
+            writer.writerow(
+                [
+                    rec.attempts,
+                    max_attempts,
+                    meta.size,
+                    meta.size_label,
+                    meta.duration_label,
+                    meta.quality,
+                    meta.resolution,
+                    meta.video_codec or "",
+                    meta.audio_codec or "",
+                    meta.bitrate_label,
+                    meta.fps or "",
+                    meta.modified,
+                    meta.name,
+                    meta.output_name,
+                    meta.folder,
+                    meta.remote_path,
+                    meta.status,
+                    rec.last_error or "",
                 ]
             )
