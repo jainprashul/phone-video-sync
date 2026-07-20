@@ -106,7 +106,7 @@ def process_cmd(
         False,
         "--recommend",
         "-r",
-        help="Process only the recommended high-value set (≥100 MB / largest quartile)",
+        help="Process only the recommended set (size/folder baseline + codec/resolution ranking)",
     ),
     folder: Optional[list[str]] = typer.Option(
         None,

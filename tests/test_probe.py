@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from phone_video_sync.ffmpeg import FFmpegError, parse_ffprobe_json
+from phone_video_sync.ffmpeg import (
+    FFmpegError,
+    _color_cli_args,
+    collect_preserve_tags,
+    parse_ffprobe_json,
+    write_head_tail_probe_file,
+)
 
 
 SAMPLE = {
@@ -71,8 +77,6 @@ def test_parse_ffprobe_json_no_video_raises() -> None:
 
 
 def test_write_head_tail_probe_file(tmp_path: Path) -> None:
-    from phone_video_sync.ffmpeg import write_head_tail_probe_file
-
     dest = tmp_path / "probe.bin"
     head = b"HEAD" + b"\x00" * 100
     tail = b"TAIL" + b"\x11" * 50
@@ -82,3 +86,56 @@ def test_write_head_tail_probe_file(tmp_path: Path) -> None:
     assert len(data) == total
     assert data[: len(head)] == head
     assert data[-len(tail) :] == tail
+
+
+def test_collect_preserve_tags_keeps_phone_fields() -> None:
+    raw = {
+        "format": {
+            "tags": {
+                "major_brand": "mp42",
+                "creation_time": "2025-07-12T14:18:58.000000Z",
+                "location": "+12.3456+078.9012/",
+                "location-eng": "+12.3456+078.9012/",
+                "com.android.version": "14",
+                "encoder": "Lavf60",
+            }
+        },
+        "streams": [
+            {
+                "codec_type": "video",
+                "tags": {"creation_time": "2025-07-12T14:18:58.000000Z", "handler_name": "Video"},
+            }
+        ],
+    }
+    tags = collect_preserve_tags(raw)
+    assert tags["creation_time"] == "2025-07-12T14:18:58.000000Z"
+    assert tags["location"] == "+12.3456+078.9012/"
+    assert tags["com.android.version"] == "14"
+    assert "major_brand" not in tags
+    assert "encoder" not in tags
+    assert "handler_name" not in tags
+
+
+def test_color_cli_args_from_stream() -> None:
+    raw = {
+        "streams": [
+            {
+                "codec_type": "video",
+                "color_primaries": "bt709",
+                "color_transfer": "bt709",
+                "color_space": "bt709",
+                "color_range": "tv",
+            }
+        ]
+    }
+    args = _color_cli_args(raw)
+    assert args == [
+        "-color_primaries",
+        "bt709",
+        "-color_trc",
+        "bt709",
+        "-colorspace",
+        "bt709",
+        "-color_range",
+        "tv",
+    ]

@@ -8,7 +8,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 from rich.progress import (
     BarColumn,
@@ -24,45 +23,43 @@ from rich.table import Table
 from phone_video_sync.adb import AdbClient, DeviceError, RemoteFile
 from phone_video_sync.config import Config, ensure_runtime_dirs, resolve_tools
 from phone_video_sync.db import Database
-from phone_video_sync.ffmpeg import (
-    encode,
-    ensure_encoder_available,
-    get_media_info,
-    probe_remote_header,
-)
+from phone_video_sync.ffmpeg import encode, ensure_encoder_available, get_media_info
 from phone_video_sync.logging_setup import get_console
 from phone_video_sync.models import RunReport, VideoRecord, VideoStatus
+from phone_video_sync.pipeline.cache import (
+    apply_media_meta_cache,
+    listing_cache_key,
+    persist_media_meta_from_remote,
+    remote_files_from_cache,
+    remote_files_to_cache_payload,
+)
+from phone_video_sync.pipeline.display import render_scan_report
+from phone_video_sync.pipeline.paths import output_remote_path, safe_local_name
+from phone_video_sync.pipeline.probe import probe_breakdown_codecs
 from phone_video_sync.report import (
     ScanBreakdown,
-    apply_probe_to_meta,
     apply_remote_map,
     build_scan_breakdown,
     filter_pending,
-    format_bytes as _format_bytes,
+    format_bytes,
     parse_size,
+    refresh_recommendations,
 )
-from phone_video_sync.report_export import save_scan_report
-from phone_video_sync.select_ui import interactive_select as _ui_select
+from phone_video_sync.report.export import save_scan_report
+from phone_video_sync.select_ui import interactive_select as ui_select
 from phone_video_sync.verify import check
 
 logger = logging.getLogger(__name__)
 
 
-def _safe_local_name(remote_path: str) -> str:
-    return remote_path.lstrip("/").replace("/", "__").replace("\\", "__")
-
-
-def _output_remote_path(remote_path: str, suffix: str) -> str:
-    path = Path(remote_path)
-    stem = path.stem
-    # Always push as mp4 for HEVC+AAC in MP4 container
-    parent = str(path.parent).replace("\\", "/")
-    if parent in {".", ""}:
-        return f"{stem}{suffix}.mp4"
-    return f"{parent}/{stem}{suffix}.mp4"
-
-
 class Pipeline:
+    """
+    End-to-end phone video sync workflow.
+
+    Stages: discover on device → build scan report → optional selection →
+    parallel pull/encode/verify/push → archive or delete originals.
+    """
+
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         ensure_runtime_dirs(cfg)
@@ -83,114 +80,10 @@ class Pipeline:
         else:
             self.console.print(f"[dim]{message}[/dim]")
 
-    def _listing_cache_key(self) -> str:
-        exts = ",".join(sorted(self.cfg.extensions))
-        return f"{self.cfg.remote_root}|{exts}"
-
-    def _remote_files_from_cache(
-        self, payload: list[dict]
-    ) -> list[RemoteFile]:
-        files: list[RemoteFile] = []
-        for row in payload:
-            path = row.get("path")
-            if not path:
-                continue
-            files.append(
-                RemoteFile(
-                    path=path,
-                    size=int(row.get("size") or 0),
-                    mtime=int(row.get("mtime") or 0),
-                    width=row.get("width"),
-                    height=row.get("height"),
-                    duration_ms=row.get("duration_ms"),
-                    mime_type=row.get("mime_type"),
-                    title=row.get("title"),
-                    resolution=row.get("resolution"),
-                )
-            )
-        return files
-
-    def _remote_files_to_cache_payload(
-        self, files: list[RemoteFile]
-    ) -> list[dict]:
-        return [
-            {
-                "path": rf.path,
-                "size": rf.size,
-                "mtime": rf.mtime,
-                "width": rf.width,
-                "height": rf.height,
-                "duration_ms": rf.duration_ms,
-                "mime_type": rf.mime_type,
-                "title": rf.title,
-                "resolution": rf.resolution,
-            }
-            for rf in files
-        ]
-
-    def _apply_media_meta_cache(self, files: list[RemoteFile]) -> list[RemoteFile]:
-        """Merge SQLite media_meta onto RemoteFile list (size+mtime must match)."""
-        cached = self.db.get_media_meta_many(
-            [(rf.path, rf.size, rf.mtime) for rf in files]
-        )
-        if not cached:
-            return files
-        out: list[RemoteFile] = []
-        for rf in files:
-            meta = cached.get(rf.path)
-            if not meta:
-                out.append(rf)
-                continue
-            duration_sec = meta.get("duration_sec")
-            duration_ms = (
-                int(duration_sec * 1000) if duration_sec is not None else rf.duration_ms
-            )
-            out.append(
-                RemoteFile(
-                    path=rf.path,
-                    size=rf.size,
-                    mtime=rf.mtime,
-                    width=meta.get("width") if meta.get("width") is not None else rf.width,
-                    height=meta.get("height") if meta.get("height") is not None else rf.height,
-                    duration_ms=duration_ms,
-                    mime_type=meta.get("mime_type") or rf.mime_type,
-                    title=meta.get("title") or rf.title,
-                    resolution=meta.get("resolution") or rf.resolution,
-                )
-            )
-        return out
-
-    def _persist_media_meta_from_remote(self, files: list[RemoteFile]) -> None:
-        rows = []
-        for rf in files:
-            if not any(
-                [
-                    rf.width,
-                    rf.height,
-                    rf.duration_ms,
-                    rf.mime_type,
-                    rf.resolution,
-                ]
-            ):
-                continue
-            rows.append(
-                {
-                    "remote_path": rf.path,
-                    "size": rf.size,
-                    "mtime": rf.mtime,
-                    "width": rf.width,
-                    "height": rf.height,
-                    "duration_sec": (rf.duration_ms / 1000.0) if rf.duration_ms else None,
-                    "mime_type": rf.mime_type,
-                    "title": rf.title,
-                    "resolution": rf.resolution or (
-                        f"{rf.width}x{rf.height}" if rf.width and rf.height else None
-                    ),
-                    "source": "mediastore",
-                }
-            )
-        if rows:
-            self.db.upsert_media_meta_batch(rows)
+    def _update_status(self, message: str) -> None:
+        """Unified status callback for sub-modules during discover/report."""
+        if self._status is not None:
+            self._status.update(message)
 
     def discover(
         self,
@@ -198,6 +91,13 @@ class Pipeline:
         require_encoder: bool = True,
         refresh: bool = False,
     ) -> tuple[list[RemoteFile], list[VideoRecord]]:
+        """
+        Connect to the phone, list videos, reconcile DB, return pending work.
+
+        Uses SQLite listing cache when ``refresh`` is false and TTL allows.
+        """
+        used_cache = False
+
         with Status(
             "[cyan]Connecting to device…[/cyan]",
             console=self.console,
@@ -216,9 +116,8 @@ class Pipeline:
                     status.update("[cyan]Checking encoder…[/cyan]")
                     ensure_encoder_available(self.tools["ffmpeg"], self.cfg.video_encoder)
 
-                cache_key = f"{device.serial}|{self._listing_cache_key()}"
+                cache_key = f"{device.serial}|{listing_cache_key(self.cfg.remote_root, self.cfg.extensions)}"
                 remote_files: list[RemoteFile] | None = None
-                used_cache = False
 
                 if not refresh and self.cfg.listing_cache_ttl_sec > 0:
                     cached = self.db.get_listing_cache(
@@ -233,8 +132,7 @@ class Pipeline:
                             f"[cyan]Loading cached listing "
                             f"({len(payload)} files, {age_min:.0f}m old)…[/cyan]"
                         )
-                        remote_files = self._remote_files_from_cache(payload)
-                        remote_files = self._apply_media_meta_cache(remote_files)
+                        remote_files = remote_files_from_cache(payload)
                         used_cache = True
                         self.console.print(
                             f"[dim]Using cached search from {scanned_at.astimezone():%H:%M:%S} "
@@ -248,16 +146,15 @@ class Pipeline:
                         self.cfg.skip_prefixes,
                         self.cfg.archive_root,
                     )
-                    # Persist MediaStore fields + listing for next run
-                    self._persist_media_meta_from_remote(remote_files)
+                    persist_media_meta_from_remote(self.db, remote_files)
                     self.db.save_listing_cache(
                         cache_key,
                         device_serial=device.serial,
-                        files=self._remote_files_to_cache_payload(remote_files),
+                        files=remote_files_to_cache_payload(remote_files),
                     )
-                else:
-                    # Still merge any newer probe rows from DB
-                    remote_files = self._apply_media_meta_cache(remote_files)
+
+                # Merge probe/MediaStore rows (covers fresh scans and cache hits).
+                remote_files = apply_media_meta_cache(self.db, remote_files)
 
                 logger.info(
                     "Discovered %d remote video(s)%s",
@@ -273,9 +170,7 @@ class Pipeline:
                     logger.info("Reconciled %d interrupted job(s) for resume", reset)
 
                 def _db_progress(done: int, total: int) -> None:
-                    status.update(
-                        f"[cyan]Updating database… {done}/{total}[/cyan]"
-                    )
+                    status.update(f"[cyan]Updating database… {done}/{total}[/cyan]")
 
                 self.db.upsert_discovered_batch(
                     [(rf.path, rf.size, rf.mtime) for rf in remote_files],
@@ -283,10 +178,12 @@ class Pipeline:
                 )
 
                 status.update("[cyan]Computing pending work…[/cyan]")
-                pending = self.db.pending_work(self.cfg.max_attempts)
                 remote_set = {rf.path for rf in remote_files}
-                pending = [p for p in pending if p.remote_path in remote_set]
-                pending = [p for p in pending if p.status != VideoStatus.DONE]
+                pending = [
+                    p
+                    for p in self.db.pending_work(self.cfg.max_attempts)
+                    if p.remote_path in remote_set and p.status != VideoStatus.DONE
+                ]
             finally:
                 self._status = None
 
@@ -305,6 +202,7 @@ class Pipeline:
         *,
         title: str = "Dry-run summary",
     ) -> ScanBreakdown:
+        """Build breakdown, probe codecs for scoring, render Rich tables, save report."""
         with Status(
             f"[cyan]Building report for {len(pending)} pending video(s)…[/cyan]",
             console=self.console,
@@ -323,280 +221,37 @@ class Pipeline:
                     output_suffix=self.cfg.output_suffix,
                 )
 
-                # Apply cached probe meta; only probe cache misses
-                recommended = list(breakdown.recommended)
-                if recommended:
-                    cached_meta = self.db.get_media_meta_many(
-                        [(r.remote_path, r.size, r.mtime) for r in recommended]
-                    )
-                    to_probe: list[VideoRecord] = []
-                    cache_hits = 0
-                    for rec in recommended:
-                        meta = cached_meta.get(rec.remote_path)
-                        if meta and meta.get("video_codec"):
-                            cache_hits += 1
-                            apply_probe_to_meta(
-                                breakdown,
-                                rec.remote_path,
-                                SimpleNamespace(
-                                    width=meta.get("width"),
-                                    height=meta.get("height"),
-                                    duration_sec=meta.get("duration_sec"),
-                                    video_codec=meta.get("video_codec"),
-                                    audio_codec=meta.get("audio_codec"),
-                                    bitrate=meta.get("bitrate"),
-                                    fps=meta.get("fps"),
-                                    pix_fmt=meta.get("pix_fmt"),
-                                    profile=meta.get("profile"),
-                                    level=meta.get("level"),
-                                ),
-                                output_suffix=self.cfg.output_suffix,
-                                remote=remote_by_path.get(rec.remote_path),
-                            )
-                        else:
-                            to_probe.append(rec)
+                probe_breakdown_codecs(
+                    breakdown,
+                    adb=self.adb,
+                    db=self.db,
+                    ffprobe_path=self.tools["ffprobe"],
+                    work_dir=self.cfg.work_dir / "probe",
+                    output_suffix=self.cfg.output_suffix,
+                    remote_by_path=remote_by_path,
+                    on_status=self._update_status,
+                    console=self.console,
+                )
 
-                    if cache_hits:
-                        self.console.print(
-                            f"[dim]Codec cache: {cache_hits}/{len(recommended)} "
-                            f"from SQLite (unchanged size+mtime).[/dim]"
-                        )
-
-                    if to_probe:
-                        total = len(to_probe)
-                        status.update(
-                            f"[cyan]Probing codecs for {total} new/changed "
-                            f"file(s) (head+tail)…[/cyan]"
-                        )
-                        done_count = 0
-                        probe_ok = 0
-                        probe_fail = 0
-
-                        def _probe_one(
-                            rec: VideoRecord,
-                        ) -> tuple[str, object | None, str | None]:
-                            try:
-                                info = probe_remote_header(
-                                    adb_client=self.adb,
-                                    remote_path=rec.remote_path,
-                                    ffprobe_path=self.tools["ffprobe"],
-                                    header_mb=2,
-                                    tail_mb=12,
-                                    work_dir=self.cfg.work_dir / "probe",
-                                )
-                                return rec.remote_path, info, None
-                            except Exception as exc:  # noqa: BLE001
-                                return rec.remote_path, None, str(exc)
-
-                        workers = min(2, max(1, total))
-                        with ThreadPoolExecutor(max_workers=workers) as pool:
-                            futures = {
-                                pool.submit(_probe_one, rec): rec for rec in to_probe
-                            }
-                            for fut in as_completed(futures):
-                                rec = futures[fut]
-                                path, info, err = fut.result()
-                                done_count += 1
-                                status.update(
-                                    f"[cyan]Probed {done_count}/{total}: "
-                                    f"{Path(path).name}[/cyan]"
-                                )
-                                if info is not None:
-                                    probe_ok += 1
-                                    apply_probe_to_meta(
-                                        breakdown,
-                                        path,
-                                        info,
-                                        output_suffix=self.cfg.output_suffix,
-                                        remote=remote_by_path.get(path),
-                                    )
-                                    self.db.upsert_media_meta(
-                                        path,
-                                        rec.size,
-                                        rec.mtime,
-                                        width=info.width or None,
-                                        height=info.height or None,
-                                        duration_sec=info.duration_sec or None,
-                                        video_codec=info.video_codec,
-                                        audio_codec=info.audio_codec,
-                                        bitrate=info.bitrate,
-                                        fps=info.fps,
-                                        pix_fmt=info.pix_fmt,
-                                        profile=info.profile,
-                                        level=info.level,
-                                        resolution=(
-                                            f"{info.width}x{info.height}"
-                                            if info.width and info.height
-                                            else None
-                                        ),
-                                        source="probe",
-                                    )
-                                else:
-                                    probe_fail += 1
-                                    logger.debug("Probe failed for %s: %s", path, err)
-
-                        if probe_fail:
-                            self.console.print(
-                                f"[yellow]Codec probe:[/yellow] {probe_ok} ok, "
-                                f"{probe_fail} failed (MediaStore fields still shown)."
-                            )
-                        else:
-                            self.console.print(
-                                f"[green]Codec probe:[/green] {probe_ok}/{total} ok "
-                                f"(saved to cache)."
-                            )
-                    else:
-                        self.console.print(
-                            "[green]Codec probe:[/green] all recommended files "
-                            "served from cache."
-                        )
+                status.update(
+                    "[cyan]Scoring recommendations (codec/resolution/size)…[/cyan]"
+                )
+                refresh_recommendations(breakdown, output_suffix=self.cfg.output_suffix)
                 status.update("[cyan]Rendering tables…[/cyan]")
             finally:
                 self._status = None
 
-        total_bytes = sum(p.size for p in pending)
-        est_out = int(total_bytes * 0.4)
-
-        overview = Table(title=title)
-        overview.add_column("Metric")
-        overview.add_column("Value", justify="right")
-        overview.add_row("Videos on device", str(len(remote_files)))
-        overview.add_row("Pending / to process", str(len(pending)))
-        overview.add_row("Pending bytes", _format_bytes(total_bytes))
-        overview.add_row("Est. output (≈40%)", _format_bytes(est_out))
-        overview.add_row("Est. savings", _format_bytes(max(0, total_bytes - est_out)))
-        overview.add_row("Output suffix", self.cfg.output_suffix)
-        overview.add_row("Encoder", self.cfg.video_encoder)
-        overview.add_row("Workers", str(self.cfg.encode_workers))
-        overview.add_row("Delete mode", self.cfg.delete_mode)
-        self.console.print(overview)
-
-        if not pending:
-            report_path = save_scan_report(
-                self.cfg.log_dir,
-                title=title,
-                remote_files=remote_files,
-                pending=pending,
-                breakdown=breakdown,
-                output_suffix=self.cfg.output_suffix,
-                encoder=self.cfg.video_encoder,
-                delete_mode=self.cfg.delete_mode,
-            )
-            self.console.print(f"[green]Report saved:[/green] {report_path}")
-            return breakdown
-
-        size_table = Table(title="Pending by size")
-        size_table.add_column("#", justify="right")
-        size_table.add_column("Bucket")
-        size_table.add_column("Files", justify="right")
-        size_table.add_column("Bytes", justify="right")
-        size_table.add_column("Est. save", justify="right")
-        for i, group in enumerate(breakdown.by_size, start=1):
-            size_table.add_row(
-                str(i),
-                group.key,
-                str(group.count),
-                _format_bytes(group.bytes),
-                _format_bytes(group.est_savings),
-            )
-        self.console.print(size_table)
-
-        folder_table = Table(title="Pending by folder (top 25)")
-        folder_table.add_column("#", justify="right")
-        folder_table.add_column("Folder")
-        folder_table.add_column("Files", justify="right")
-        folder_table.add_column("Bytes", justify="right")
-        folder_table.add_column("Est. save", justify="right")
-        for i, group in enumerate(breakdown.by_folder[:25], start=1):
-            folder_table.add_row(
-                str(i),
-                group.key,
-                str(group.count),
-                _format_bytes(group.bytes),
-                _format_bytes(group.est_savings),
-            )
-        if len(breakdown.by_folder) > 25:
-            folder_table.add_row(
-                "",
-                f"… and {len(breakdown.by_folder) - 25} more folders",
-                "",
-                "",
-                "",
-            )
-        self.console.print(folder_table)
-
-        rec_bytes = sum(r.size for r in breakdown.recommended)
-        rec_table = Table(title="Recommendation")
-        rec_table.add_column("Detail")
-        rec_table.add_row(breakdown.recommend_reason)
-        rec_table.add_row(
-            f"[bold]Recommended set:[/bold] {len(breakdown.recommended)} file(s), "
-            f"{_format_bytes(rec_bytes)} "
-            f"(est. save {_format_bytes(int(rec_bytes * 0.6))})"
+        render_scan_report(
+            self.console,
+            title=title,
+            remote_files=remote_files,
+            pending=pending,
+            breakdown=breakdown,
+            output_suffix=self.cfg.output_suffix,
+            encoder=self.cfg.video_encoder,
+            encode_workers=self.cfg.encode_workers,
+            delete_mode=self.cfg.delete_mode,
         )
-        self.console.print(rec_table)
-
-        # ALL recommended files with full video metadata
-        if breakdown.recommended:
-            meta_table = Table(
-                title=(
-                    f"All recommended ({len(breakdown.recommended)}) — "
-                    f"resolution / quality / codec / type  "
-                    f"(output suffix '{self.cfg.output_suffix}')"
-                ),
-                show_lines=False,
-            )
-            meta_table.add_column("#", justify="right", style="dim")
-            meta_table.add_column("Size", justify="right")
-            meta_table.add_column("Dur")
-            meta_table.add_column("Quality")
-            meta_table.add_column("Resolution")
-            meta_table.add_column("V-Codec")
-            meta_table.add_column("A-Codec")
-            meta_table.add_column("Bitrate")
-            meta_table.add_column("FPS")
-            meta_table.add_column("Type")
-            meta_table.add_column("Profile")
-            meta_table.add_column("Modified")
-            meta_table.add_column("Name")
-            meta_table.add_column("Output")
-            meta_table.add_column("Folder")
-
-            ordered = sorted(
-                breakdown.recommended, key=lambda r: r.size, reverse=True
-            )
-            for i, item in enumerate(ordered, start=1):
-                meta = breakdown.metas.get(item.remote_path)
-                if not meta:
-                    continue
-                vcodec = meta.video_codec or "?"
-                if meta.pix_fmt:
-                    vcodec = f"{vcodec}/{meta.pix_fmt}"
-                profile = meta.profile or "?"
-                if meta.level and meta.level not in {"?", "-99", "0"}:
-                    profile = f"{profile}@{meta.level}"
-                mime = meta.mime_type or (meta.container or meta.extension)
-                folder = meta.folder
-                if len(folder) > 40:
-                    folder = "…" + folder[-37:]
-                meta_table.add_row(
-                    str(i),
-                    meta.size_label,
-                    meta.duration_label,
-                    meta.quality,
-                    meta.resolution,
-                    vcodec,
-                    meta.audio_codec or "?",
-                    meta.bitrate_label,
-                    meta.fps or "?",
-                    str(mime),
-                    profile,
-                    meta.modified,
-                    meta.name,
-                    meta.output_name,
-                    folder,
-                )
-            self.console.print(meta_table)
 
         report_path = save_scan_report(
             self.cfg.log_dir,
@@ -610,9 +265,7 @@ class Pipeline:
         )
         self.console.print(f"[green]Report saved:[/green] {report_path}")
         if breakdown.recommended:
-            csv_sibling = report_path.with_name(
-                report_path.stem + "-recommended.csv"
-            )
+            csv_sibling = report_path.with_name(report_path.stem + "-recommended.csv")
             if csv_sibling.exists():
                 self.console.print(f"[green]CSV saved:[/green] {csv_sibling}")
 
@@ -623,7 +276,7 @@ class Pipeline:
         if not breakdown.pending:
             return []
         try:
-            return _ui_select(breakdown)
+            return ui_select(breakdown)
         except Exception as exc:  # noqa: BLE001
             self.console.print(f"[red]Interactive select failed:[/red] {exc}")
             return None
@@ -631,10 +284,10 @@ class Pipeline:
     def process_one(self, record: VideoRecord) -> None:
         """Pull → encode → verify → push → archive/delete. Raises on failure."""
         remote = record.remote_path
-        local_name = _safe_local_name(remote)
+        local_name = safe_local_name(remote)
         local_in = self.cfg.work_in / local_name
         local_out = self.cfg.work_out / f"{Path(local_name).stem}{self.cfg.output_suffix}.mp4"
-        remote_out = _output_remote_path(remote, self.cfg.output_suffix)
+        remote_out = output_remote_path(remote, self.cfg.output_suffix)
 
         try:
             self.db.set_status(remote, VideoStatus.PULLING, local_path=str(local_in))
@@ -657,7 +310,13 @@ class Pipeline:
             )
 
             logger.info("Encoding %s -> %s", local_in.name, local_out.name)
-            encode(local_in, local_out, self.cfg, self.tools["ffmpeg"])
+            encode(
+                local_in,
+                local_out,
+                self.cfg,
+                self.tools["ffmpeg"],
+                src_info=src_info,
+            )
 
             self.db.set_status(remote, VideoStatus.VERIFYING)
             out_info = get_media_info(
@@ -735,6 +394,7 @@ class Pipeline:
         recommend: bool = False,
         refresh: bool = False,
     ) -> RunReport:
+        """Shared entry for scan (dry_run) and process commands."""
         report = RunReport()
         try:
             remote_files, pending = self.discover(
@@ -747,26 +407,32 @@ class Pipeline:
 
         min_bytes = parse_size(min_size) if min_size else None
         max_bytes = parse_size(max_size) if max_size else None
+        # Folder/size filters first; --recommend applied after codec-aware scoring
         pending = filter_pending(
             pending,
             folders=folders,
             min_bytes=min_bytes,
             max_bytes=max_bytes,
-            recommended_only=recommend,
         )
 
-        if limit is not None:
-            pending = pending[:limit]
-
-        # Count already-done for skipped
-        counts = self.db.count_by_status()
-        report.skipped = counts.get(VideoStatus.DONE.value, 0)
+        report.skipped = self.db.count_by_status().get(VideoStatus.DONE.value, 0)
 
         breakdown = self.print_summary(
             remote_files,
             pending,
             title="Scan report" if dry_run else "Process plan",
         )
+
+        if recommend:
+            pending = list(breakdown.recommended)
+            self.console.print(
+                f"[cyan]Using recommended set:[/cyan] {len(pending)} file(s) "
+                f"({format_bytes(sum(p.size for p in pending))}) — "
+                f"{breakdown.recommend_reason}"
+            )
+
+        if limit is not None:
+            pending = pending[:limit]
 
         if dry_run and not select:
             self.console.print(
@@ -787,7 +453,7 @@ class Pipeline:
                 return report
             self.console.print(
                 f"[cyan]Selected {len(pending)} file(s) "
-                f"({_format_bytes(sum(p.size for p in pending))}).[/cyan]"
+                f"({format_bytes(sum(p.size for p in pending))}).[/cyan]"
             )
             if dry_run:
                 # scan --select: ask whether to process now
@@ -812,6 +478,12 @@ class Pipeline:
                 self.console.print("[yellow]Aborted.[/yellow]")
                 return report
 
+        self._process_batch(pending, report)
+        self._print_report(report)
+        return report
+
+    def _process_batch(self, pending: list[VideoRecord], report: RunReport) -> None:
+        """Encode pending videos with retries and a Rich progress bar."""
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -866,9 +538,6 @@ class Pipeline:
                         report.errors.append(f"{rec.remote_path}: {err}")
                     progress.advance(task_id)
 
-        self._print_report(report)
-        return report
-
     def scan(self, *, select: bool = False, refresh: bool = False) -> RunReport:
         """Discover videos and update SQLite without transferring (unless --select processes)."""
         return self.run(dry_run=True, yes=True, select=select, refresh=refresh)
@@ -907,9 +576,7 @@ class Pipeline:
         limit: int | None = None,
     ) -> None:
         """Poll for an authorized device, then process pending videos."""
-        poll = interval if interval is not None else self.cfg.watch_interval_sec
-        if poll < 1:
-            poll = 1.0
+        poll = max(1.0, interval if interval is not None else self.cfg.watch_interval_sec)
         self.console.print(
             f"[cyan]Watching for ADB device every {poll:.0f}s "
             f"({'once' if once else 'continuous'}). Ctrl+C to stop.[/cyan]"
@@ -932,9 +599,7 @@ class Pipeline:
                 continue
 
             if device.serial != last_serial:
-                self.console.print(
-                    f"[green]Device connected:[/green] {device.serial}"
-                )
+                self.console.print(f"[green]Device connected:[/green] {device.serial}")
                 last_serial = device.serial
                 report = self.process(yes=yes, limit=limit)
                 if report.errors and report.done == 0 and report.failed:
@@ -954,11 +619,7 @@ class Pipeline:
         if limit is not None:
             done = done[:limit]
 
-        ok = 0
-        missing_output = 0
-        missing_path = 0
-        checked = 0
-
+        ok = missing_output = missing_path = checked = 0
         table = Table(title="Verify results")
         table.add_column("Remote original")
         table.add_column("Compressed")
@@ -1054,12 +715,12 @@ class Pipeline:
             if n:
                 table.add_row(
                     f"  {status.value}",
-                    f"{n} ({_format_bytes(sizes.get(status.value, 0))})",
+                    f"{n} ({format_bytes(sizes.get(status.value, 0))})",
                 )
-        table.add_row("Pending now", f"{len(pending)} ({_format_bytes(pending_bytes)})")
-        table.add_row("Original bytes (done)", _format_bytes(original))
-        table.add_row("Compressed bytes (done)", _format_bytes(output))
-        table.add_row("Bytes saved (all time)", _format_bytes(saved))
+        table.add_row("Pending now", f"{len(pending)} ({format_bytes(pending_bytes)})")
+        table.add_row("Original bytes (done)", format_bytes(original))
+        table.add_row("Compressed bytes (done)", format_bytes(output))
+        table.add_row("Bytes saved (all time)", format_bytes(saved))
         if original > 0:
             ratio = (1 - output / original) * 100
             table.add_row("Avg compression", f"{ratio:.1f}% smaller")
@@ -1088,8 +749,8 @@ class Pipeline:
         table.add_row("Done", str(report.done))
         table.add_row("Failed", str(report.failed))
         table.add_row("Previously done (skipped)", str(report.skipped))
-        table.add_row("Bytes saved (this run)", _format_bytes(report.saved_bytes))
-        table.add_row("Bytes saved (all time)", _format_bytes(self.db.total_saved_bytes()))
+        table.add_row("Bytes saved (this run)", format_bytes(report.saved_bytes))
+        table.add_row("Bytes saved (all time)", format_bytes(self.db.total_saved_bytes()))
         self.console.print(table)
 
     def status_table(self) -> None:
@@ -1100,7 +761,7 @@ class Pipeline:
         table.add_column("Count", justify="right")
         for status in VideoStatus:
             table.add_row(status.value, str(counts.get(status.value, 0)))
-        table.add_row("Total saved", _format_bytes(self.db.total_saved_bytes()))
+        table.add_row("Total saved", format_bytes(self.db.total_saved_bytes()))
         self.console.print(table)
 
     def purge_archive(self, *, yes: bool = False) -> None:

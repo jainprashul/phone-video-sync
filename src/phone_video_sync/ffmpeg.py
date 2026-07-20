@@ -368,6 +368,75 @@ def _clear_partial_size(info: MediaInfo, max_trusted: int) -> MediaInfo:
     return info
 
 
+# Container/brand tags that must not be force-copied onto the remuxed MP4.
+_SKIP_METADATA_KEYS = frozenset(
+    {
+        "major_brand",
+        "minor_version",
+        "compatible_brands",
+        "encoder",
+        "EncodingSettings",
+        "handler_name",
+    }
+)
+
+
+def collect_preserve_tags(raw: dict[str, Any] | None) -> dict[str, str]:
+    """Collect format + primary stream tags that should survive re-encode."""
+    if not raw:
+        return {}
+    tags: dict[str, str] = {}
+    fmt_tags = (raw.get("format") or {}).get("tags") or {}
+    for key, value in fmt_tags.items():
+        if value is None:
+            continue
+        tags[str(key)] = str(value)
+    # Stream tags (creation_time, language, …) — format wins on key clash.
+    for stream in raw.get("streams") or []:
+        if stream.get("codec_type") not in {"video", "audio"}:
+            continue
+        for key, value in (stream.get("tags") or {}).items():
+            if value is None or key in tags:
+                continue
+            tags[str(key)] = str(value)
+    return {
+        key: value
+        for key, value in tags.items()
+        if key not in _SKIP_METADATA_KEYS and value != ""
+    }
+
+
+def _metadata_cli_args(tags: dict[str, str]) -> list[str]:
+    args: list[str] = []
+    for key, value in tags.items():
+        args.extend(["-metadata", f"{key}={value}"])
+    return args
+
+
+def _color_cli_args(raw: dict[str, Any] | None) -> list[str]:
+    """Pass through color signalling from the source video stream when present."""
+    if not raw:
+        return []
+    video = next(
+        (s for s in (raw.get("streams") or []) if s.get("codec_type") == "video"),
+        None,
+    )
+    if not video:
+        return []
+    args: list[str] = []
+    mapping = (
+        ("color_primaries", "-color_primaries"),
+        ("color_transfer", "-color_trc"),
+        ("color_space", "-colorspace"),
+        ("color_range", "-color_range"),
+    )
+    for src_key, flag in mapping:
+        value = video.get(src_key)
+        if value and str(value).lower() not in {"unknown", "unspecified", "n/a"}:
+            args.extend([flag, str(value)])
+    return args
+
+
 def encode(
     input_path: Path,
     output_path: Path,
@@ -375,13 +444,23 @@ def encode(
     ffmpeg_path: str,
     *,
     timeout: int | None = None,
+    src_info: MediaInfo | None = None,
 ) -> None:
-    """Encode with configured video encoder (default hevc_nvenc) preserving metadata."""
+    """Encode with configured video encoder (default hevc_nvenc) preserving metadata.
+
+    Copies global + per-stream tags and chapters, re-applies phone tags (creation_time,
+    location, …) explicitly, and keeps source color signalling when available.
+    """
     if not input_path.is_file():
         raise FFmpegError(f"Input missing: {input_path}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
+
+    raw = src_info.raw if src_info is not None else None
+    preserve_tags = collect_preserve_tags(raw)
+    if src_info is not None and src_info.creation_time and "creation_time" not in preserve_tags:
+        preserve_tags["creation_time"] = src_info.creation_time
 
     cmd = [
         ffmpeg_path,
@@ -391,6 +470,10 @@ def encode(
         "error",
         "-i",
         str(input_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
         "-c:v",
         cfg.video_encoder,
         "-preset",
@@ -403,8 +486,18 @@ def encode(
         "aac",
         "-b:a",
         cfg.audio_bitrate,
+        *_color_cli_args(raw),
+        # Global container tags + matching stream tags + chapters.
         "-map_metadata",
         "0",
+        "-map_metadata:s:v",
+        "0:s:v",
+        "-map_metadata:s:a",
+        "0:s:a",
+        "-map_chapters",
+        "0",
+        # Force-write phone tags (GPS, creation_time, com.android.*) as mdta atoms.
+        *_metadata_cli_args(preserve_tags),
         "-movflags",
         "use_metadata_tags+faststart",
         str(output_path),
@@ -415,6 +508,13 @@ def encode(
         raise FFmpegError(f"ffmpeg encode failed: {detail}")
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise FFmpegError(f"Encode produced empty output: {output_path}")
+
+    # Keep local mtime aligned with the source (remote mtime is set separately on push).
+    try:
+        src_stat = input_path.stat()
+        os.utime(output_path, (src_stat.st_atime, src_stat.st_mtime))
+    except OSError:
+        pass
 
 
 def _to_float(value: Any) -> float | None:

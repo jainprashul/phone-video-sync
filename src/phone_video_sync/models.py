@@ -9,15 +9,17 @@ from typing import Any
 
 
 class VideoStatus(str, Enum):
-    DISCOVERED = "discovered"
+    """Per-video state machine persisted in SQLite."""
+
+    DISCOVERED = "discovered"  # seen on phone, not yet processed
     PULLING = "pulling"
     PULLED = "pulled"
     ENCODING = "encoding"
     VERIFYING = "verifying"
     PUSHING = "pushing"
-    FINALIZING = "finalizing"
+    FINALIZING = "finalizing"  # archive/delete original on phone
     DONE = "done"
-    FAILED = "failed"
+    FAILED = "failed"  # eligible for retry until max_attempts
 
 
 IN_PROGRESS_STATUSES: frozenset[VideoStatus] = frozenset(
