@@ -139,3 +139,4 @@ class RunReport:
     skipped: int = 0
     saved_bytes: int = 0
     errors: list[str] = field(default_factory=list)
+    completed: list[VideoRecord] = field(default_factory=list)

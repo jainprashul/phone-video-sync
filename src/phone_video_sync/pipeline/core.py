@@ -7,7 +7,7 @@ import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from rich.progress import (
     BarColumn,
@@ -550,6 +550,7 @@ class Pipeline:
                         if done_rec and done_rec.status == VideoStatus.DONE:
                             report.done += 1
                             report.saved_bytes += done_rec.saved_bytes or 0
+                            report.completed.append(done_rec)
                         else:
                             report.failed += 1
                     else:
@@ -762,6 +763,13 @@ class Pipeline:
             self.console.print(fail_table)
 
     def _print_report(self, report: RunReport) -> None:
+        original_total = sum(rec.size for rec in report.completed)
+        run_saved_pct = (
+            (report.saved_bytes / original_total) * 100 if original_total else 0.0
+        )
+        all_original, _all_output, all_saved = self.db.compression_totals()
+        all_saved_pct = (all_saved / all_original) * 100 if all_original else 0.0
+
         table = Table(title="Run report")
         table.add_column("Metric")
         table.add_column("Value", justify="right")
@@ -769,8 +777,40 @@ class Pipeline:
         table.add_row("Failed", str(report.failed))
         table.add_row("Previously done (skipped)", str(report.skipped))
         table.add_row("Bytes saved (this run)", format_bytes(report.saved_bytes))
-        table.add_row("Bytes saved (all time)", format_bytes(self.db.total_saved_bytes()))
+        table.add_row("Total saved % (this run)", f"{run_saved_pct:.1f}%")
+        table.add_row("Bytes saved (all time)", format_bytes(all_saved))
+        table.add_row("Total saved % (all time)", f"{all_saved_pct:.1f}%")
         self.console.print(table)
+
+        if not report.completed:
+            return
+
+        files = Table(title="Processed files")
+        files.add_column("File")
+        files.add_column("Original", justify="right")
+        files.add_column("Updated", justify="right")
+        files.add_column("Change %", justify="right")
+        files.add_column("Total saved %", justify="right")
+
+        cumulative_saved = 0
+        for rec in report.completed:
+            original = rec.size
+            updated = rec.out_size if rec.out_size is not None else 0
+            saved = rec.saved_bytes if rec.saved_bytes is not None else max(0, original - updated)
+            change_pct = ((original - updated) / original * 100) if original else 0.0
+            cumulative_saved += saved
+            total_saved_pct = (
+                (cumulative_saved / original_total) * 100 if original_total else 0.0
+            )
+            name = PurePosixPath(rec.remote_path).name
+            files.add_row(
+                name,
+                format_bytes(original),
+                format_bytes(updated),
+                f"{change_pct:.1f}%",
+                f"{total_saved_pct:.1f}%",
+            )
+        self.console.print(files)
 
     def status_table(self) -> None:
         """Compact status summary (alias of a lighter stats view)."""
